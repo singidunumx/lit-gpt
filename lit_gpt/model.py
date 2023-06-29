@@ -71,23 +71,32 @@ class GPT(nn.Module):
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
         assert T <= block_size, f"Cannot forward sequence of length {T}, block size is only {block_size}"
 
-        if self.rope_cache is None:
-            self.rope_cache = self.build_rope_cache(idx)
-        # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need the mask
-        # for the kv-cache support (only during inference), we only create it in that situation
-        # this will be resolved by https://github.com/pytorch/pytorch/issues/96099
-        if use_kv_cache and self.mask_cache is None:
-            self.mask_cache = self.build_mask_cache(idx)
+        if not self.config.alibi:
+            if self.rope_cache is None:
+                self.rope_cache = self.build_rope_cache(idx)
+            cos, sin = self.rope_cache
+            if use_kv_cache:
+                cos = cos.index_select(0, input_pos)
+                sin = sin.index_select(0, input_pos)
+            else:
+                cos = cos[:T]
+                sin = sin[:T]
+            rope = cos, sin
+        else:
+            rope = None
 
-        cos, sin = self.rope_cache
-        if use_kv_cache:
-            cos = cos.index_select(0, input_pos)
-            sin = sin.index_select(0, input_pos)
+        if use_kv_cache or self.config.alibi:
+            # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need it
+            # for the above cases we only create it for them. we will be able to always create them after
+            # https://github.com/pytorch/pytorch/issues/96099 is resolved
+            if self.mask_cache is None:
+                self.mask_cache = self.build_mask_cache(idx)
+            if self.config.alibi:
+                # FIXME: max_seq_length or block_size?
+                self.mask_cache += build_alibi_mask(self.config.n_head, max_seq_length, idx.device)
             mask = self.mask_cache.index_select(2, input_pos)
             mask = mask[:, :, :, :max_seq_length]
         else:
-            cos = cos[:T]
-            sin = sin[:T]
             mask = None
 
         # forward the model itself
@@ -95,11 +104,12 @@ class GPT(nn.Module):
 
         if not use_kv_cache:
             for block in self.transformer.h:
-                x, *_ = block(x, (cos, sin), max_seq_length)
+                x, *_ = block(x, max_seq_length, rope)
         else:
+            # FIXME
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1))
             for i, block in enumerate(self.transformer.h):
-                x, self.kv_caches[i] = block(x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
+                x, self.kv_caches[i] = block(x, max_seq_length, rope, mask, input_pos, self.kv_caches[i])
 
         x = self.transformer.ln_f(x)
 
@@ -120,8 +130,12 @@ class GPT(nn.Module):
         )
 
     def build_mask_cache(self, idx: torch.Tensor) -> torch.Tensor:
-        ones = torch.ones((self.config.block_size, self.config.block_size), device=idx.device, dtype=torch.bool)
-        return torch.tril(ones).unsqueeze(0).unsqueeze(0)
+        # we use a floating mask instead of boolean for alibi support
+        mask = torch.ones((self.config.block_size, self.config.block_size), device=idx.device).tril()
+        # not -inf because of https://github.com/pytorch/pytorch/issues/103749
+        fill_value = torch.finfo(torch.get_default_dtype()).min
+        mask = mask.masked_fill(mask == 0, fill_value)
+        return mask.unsqueeze(0).unsqueeze(0)
 
     def build_kv_caches(self, idx: torch.Tensor, max_seq_length: int, rope_cache_length: int) -> List[KVCache]:
         B = idx.size(0)
@@ -154,14 +168,14 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        rope: RoPECache,
         max_seq_length: int,
+        rope: Optional[RoPECache] = None,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         n_1 = self.norm_1(x)
-        h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
+        h, new_kv_cache = self.attn(n_1, max_seq_length, rope, mask, input_pos, kv_cache)
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
             x = x + h + self.mlp(n_2)
@@ -190,8 +204,8 @@ class CausalSelfAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        rope: RoPECache,
         max_seq_length: int,
+        rope: Optional[RoPECache] = None,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
@@ -221,11 +235,12 @@ class CausalSelfAttention(nn.Module):
 
         n_elem = int(self.config.rotary_percentage * self.config.head_size)
 
-        cos, sin = rope
-        q_roped = apply_rope(q[..., :n_elem], cos, sin)
-        k_roped = apply_rope(k[..., :n_elem], cos, sin)
-        q = torch.cat((q_roped, q[..., n_elem:]), dim=-1)
-        k = torch.cat((k_roped, k[..., n_elem:]), dim=-1)
+        if rope is not None:
+            cos, sin = rope
+            q_roped = apply_rope(q[..., :n_elem], cos, sin)
+            k_roped = apply_rope(k[..., :n_elem], cos, sin)
+            q = torch.cat((q_roped, q[..., n_elem:]), dim=-1)
+            k = torch.cat((k_roped, k[..., n_elem:]), dim=-1)
 
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
@@ -301,3 +316,28 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
     roped = (x * cos) + (rotated * sin)
     return roped.type_as(x)
+
+
+def build_alibi_mask(n_head: int, seq_len: int, device: torch.device) -> torch.Tensor:
+    """https://github.com/ofirpress/attention_with_linear_biases."""
+
+    def get_slopes_power_of_2(n: int) -> List[float]:
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        ratio = start
+        return [start * ratio**i for i in range(n)]
+
+    def get_alibi_slopes(n: int) -> List[float]:
+        if math.log2(n).is_integer():
+            return get_slopes_power_of_2(n)
+        else:
+            # FIXME: compare mosaic impl
+            # https://github.com/mosaicml/llm-foundry/blob/main/llmfoundry/models/layers/attention.py#L609
+            closest_power_of_2 = 2 ** math.floor(math.log2(n))
+            return (
+                get_slopes_power_of_2(closest_power_of_2)
+                + get_alibi_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+            )
+
+    distance = torch.arange(seq_len, device=device) - torch.arange(seq_len, device=device).view(-1, 1)  # (T, T)
+    scalars = torch.tensor(get_alibi_slopes(n_head), device=device)  # (nh,)
+    return distance * scalars.view(-1, 1, 1)  # (T, T) x (nh, 1, 1) -> (nh, T, T)

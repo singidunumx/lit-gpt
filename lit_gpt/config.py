@@ -15,7 +15,7 @@ class Config:
     n_layer: int = 16
     n_head: int = 32
     n_embd: int = 4096
-    rotary_percentage: float = 0.25
+    rotary_percentage: Optional[float] = None
     parallel_residual: bool = True
     bias: bool = True
     # to use multi-head attention (MHA), set this to `n_head` (default)
@@ -40,6 +40,7 @@ class Config:
     # credit https://arxiv.org/pdf/2305.13245.pdf
     n_query_groups: Optional[int] = None
     shared_attention_norm: bool = False
+    alibi: bool = False
 
     def __post_init__(self):
         # error checking
@@ -52,6 +53,13 @@ class Config:
             assert self.n_head % self.n_query_groups == 0
         else:
             self.n_query_groups = self.n_head
+        # alibi checks
+        if self.alibi:
+            if self.rotary_percentage is not None:
+                raise ValueError("`rotary_percentage` should not be set with `alibi`")
+        else:
+            if self.rotary_percentage is None:
+                self.rotary_percentage = 0.25
 
     @property
     def head_size(self) -> int:
@@ -178,3 +186,25 @@ falcon = {
 for k in list(falcon):
     for kind in ("", "-instruct"):
         configs[k.format(kind)] = falcon[k]
+
+
+###############
+# MosaicML MPT
+###############
+mosaicml = {
+    # https://huggingface.co/mosaicml/mpt-7b/blob/main/config.json
+    "mpt-7b": dict(
+        block_size=2048,
+        padded_vocab_size=50432,
+        n_layer=32,
+        n_head=32,
+        n_embd=4096,
+        alibi=True,
+        parallel_residual=False,
+        bias=False,
+        intermediate_size=8640,
+        # initialization is done with kaiming_normal_. this is not implemented
+    ),
+    # FIXME
+}
+configs.update(mosaicml)
