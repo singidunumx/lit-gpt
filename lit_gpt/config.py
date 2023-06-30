@@ -51,7 +51,6 @@ class Config:
     intermediate_size: Optional[int] = None
     pos_encoding: Literal["RoPE", "ALiBi"] = "RoPE"
 
-
     def __post_init__(self):
         # error checking
         assert self.n_embd % self.n_head == 0
@@ -70,7 +69,7 @@ class Config:
             else:
                 self.intermediate_size = 4 * self.n_embd
         # alibi checks
-        if self.alibi:
+        if self.pos_encoding == "ALiBi":
             if self.rotary_percentage is not None:
                 raise ValueError("`rotary_percentage` should not be set with `alibi`")
         elif self.rotary_percentage is None:

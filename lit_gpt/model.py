@@ -73,7 +73,7 @@ class GPT(nn.Module):
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
         assert T <= block_size, f"Cannot forward sequence of length {T}, block size is only {block_size}"
 
-        if not self.config.alibi:
+        if not self.config.pos_encoding == "ALiBi":
             if self.rope_cache is None:
                 self.rope_cache = self.build_rope_cache(idx)
             cos, sin = self.rope_cache
@@ -87,13 +87,13 @@ class GPT(nn.Module):
         else:
             rope = None
 
-        if use_kv_cache or self.config.alibi:
+        if use_kv_cache or self.config.pos_encoding == "ALiBi":
             # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need it
             # for the above cases we only create it for them. we will be able to always create them after
             # https://github.com/pytorch/pytorch/issues/96099 is resolved
             if self.mask_cache is None:
                 self.mask_cache = self.build_mask_cache(idx)
-            if self.config.alibi:
+            if self.config.pos_encoding == "ALiBi":
                 # FIXME: max_seq_length or block_size?
                 self.mask_cache += build_alibi_mask(self.config.n_head, max_seq_length, idx.device)
             mask = self.mask_cache.index_select(2, input_pos)
