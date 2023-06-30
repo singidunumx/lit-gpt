@@ -222,7 +222,7 @@ def get_sample_data():
 
 
 @torch.no_grad()
-def llama_blockwise_quantization(model, sample_inputs, working_device, *, bits=4, groupsize=-1):
+def blockwise_quantization(model, sample_inputs, working_device, *, bits=4, groupsize=-1):
     """
     This is the classic post-training quantization of all linear layers.
     We quantize in order, i.e. when observing the inputs, we use the outputs of the previously quantized layers rather
@@ -247,7 +247,11 @@ def llama_blockwise_quantization(model, sample_inputs, working_device, *, bits=4
     # better than relying on enumeration? originally the code bundled
     # the two mlp fc layers
     # we could automate this with a lot of hooks and another iteration
-    submodules_to_process = ["attn.attn", "attn.proj", "mlp.fc", "mlp.proj"]
+    submodules_to_process = ["attn.attn", "attn.proj", "mlp.proj"]
+    if model.config._mlp_class == "GptNeoxMLP":
+        submodules_to_process.append("mlp.fc")
+    else:
+        submodules_to_process.extend(["mlp.fc_1", "mlp.fc_2"])
 
     for i, block in enumerate(model.transformer.h):
         block.to(working_device)
@@ -349,7 +353,7 @@ def main(
 
     model.eval()
 
-    tokenizer = Tokenizer(checkpoint_dir / "tokenizer.json", checkpoint_dir / "tokenizer_config.json")
+    tokenizer = Tokenizer(checkpoint_dir)
 
     test_string = get_sample_data()
     encoded_text = tokenizer.encode(test_string, eos=True)
@@ -357,7 +361,7 @@ def main(
     encoded_text = encoded_text[: n_samples * block_size].reshape(n_samples, block_size)
 
     t0 = time.perf_counter()
-    llama_blockwise_quantization(model, encoded_text, device, bits=4)
+    blockwise_quantization(model, encoded_text, device, bits=4)
     t = time.perf_counter() - t0
 
     print(f"\n\nTime for quantization: {t:.02f} sec total", file=sys.stderr)

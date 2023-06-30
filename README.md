@@ -19,23 +19,18 @@
 
 # ⚡ Lit-GPT
 
-Hackable implementation of state-of-the-art open-source large language models:
+Hackable [implementation](lit_gpt/model.py) of state-of-the-art open-source large language models released under the **Apache 2.0 license**.
 
-- StabilityAI [StableLM](https://github.com/Stability-AI/StableLM)
-- EleutherAI [Pythia](https://github.com/EleutherAI/pythia)
-- Together [RedPajama-INCITE](https://www.together.xyz/blog/redpajama-models-v1)
-- TII UAE [Falcon](https://falconllm.tii.ae)
+Supports popular public checkpoints such as:
 
-released under the **Apache 2.0 license**.
+- TII UAE [Falcon](tutorials/download_falcon.md)
+- OpenLM Research [OpenLLaMA](tutorials/download_openllama.md)
+- LMSYS [Vicuna](tutorials/download_vicuna.md)
+- Together [RedPajama-INCITE](tutorials/download_redpajama_incite.md)
+- EleutherAI [Pythia](tutorials/download_pythia.md)
+- StabilityAI [StableLM](tutorials/download_stablelm.md)
 
-This implementation builds on [Lit-LLaMA](https://github.com/lightning-AI/lit-llama) and [nanoGPT](https://github.com/karpathy/nanoGPT), and it's powered by [Lightning Fabric](https://lightning.ai/docs/fabric/stable/) ⚡.
-
-Weights can be downloaded following these instructions:
-
-- [StableLM](howto/download_stablelm.md)
-- [Pythia](howto/download_pythia.md)
-- [Redpajama-INCITE](howto/download_redpajama_incite.md)
-- [Falcon](howto/download_falcon.md)
+This implementation extends on [Lit-LLaMA](https://github.com/lightning-AI/lit-llama) and [nanoGPT](https://github.com/karpathy/nanoGPT), and it's **powered by [Lightning Fabric](https://lightning.ai/docs/fabric/stable/) ⚡**.
 
 ## Design principles
 
@@ -45,7 +40,7 @@ This repository follows the main principle of **openness through clarity**.
 
 - **Simple:** Single-file implementation without boilerplate.
 - **Correct:** Numerically equivalent to the original model.
-- **Optimized:** Runs on consumer hardware or at scale.
+- **Optimized:** Runs fast on consumer hardware or at scale.
 - **Open-source:** No strings attached.
 
 Avoiding code duplication is **not** a goal. **Readability** and **hackability** are.
@@ -65,7 +60,7 @@ git clone https://github.com/Lightning-AI/lit-gpt
 cd lit-gpt
 ```
 
-Lit-GPT currently relies on FlashAttention from PyTorch nightly. Until PyTorch 2.1 is released you'll need to install nightly manually.
+Lit-GPT currently relies on flash attention from PyTorch nightly. Until PyTorch 2.1 is released you'll need to install nightly manually.
 Luckily that is straightforward:
 
 **On CUDA**
@@ -92,7 +87,7 @@ You are all set! 🎉
 
 ## Use the model
 
-To generate text predictions, you need to download the model weights. **If you don't have them, check out our [guide](howto/download_stablelm.md).**
+To generate text predictions, you need to download the model weights. **If you don't have them, check out our [guide](tutorials/download_stablelm.md).**
 
 Run inference:
 
@@ -102,7 +97,7 @@ python generate/base.py --prompt "Hello, my name is"
 
 This will run the 3B pre-trained model and require ~7 GB of GPU memory using the `bfloat16` datatype.
 
-[Full guide for generating samples from the model](howto/inference.md).
+[Full guide for generating samples from the model](tutorials/inference.md).
 
 You can also chat with the model interactively:
 
@@ -112,7 +107,7 @@ python chat/base.py
 
 ### Run large models on smaller consumer devices
 
-We support LLM.int8 and GPTQ.int4 inference by following [this guide](howto/inference.md#run-large-models-on-consumer-devices).
+We support LLM.int8 and GPTQ.int4 inference by following [this guide](tutorials/inference.md#run-large-models-on-consumer-devices).
 
 ## Finetune the model
 
@@ -136,18 +131,17 @@ python finetune/adapter.py
 
 or Adapter v2 ([Gao et al. 2023](https://arxiv.org/abs/2304.15010)):
 
-```python 
-finetune/adapter_v2.py
+```bash
+python finetune/adapter_v2.py
 ```
 
 or LoRA ([Hu et al. 2021](https://arxiv.org/abs/2106.09685)):
-
 
 ```bash
 python finetune/lora.py
 ```
 
-(Please see the [howto/finetune_adapter](howto/finetune_adapter.md) for details on the differences between the two adapter methods.)
+(Please see the [tutorials/finetune_adapter](tutorials/finetune_adapter.md) for details on the differences between the two adapter methods.)
 
 The finetuning requires at least one GPU with ~12 GB memory (RTX 3060).
 
@@ -158,8 +152,8 @@ More details about each finetuning method and how you can apply it to your own d
 
 These technical tutorials illustrate how to run the finetuning code.
 
-- [Finetune with Adapters](howto/finetune_adapter.md)
-- [Finetune with LoRA](howto/finetune_lora.md)
+- [Finetune with Adapters](tutorials/finetune_adapter.md)
+- [Finetune with LoRA](tutorials/finetune_lora.md)
 
 ### Understanding Finetuning -- Conceptual Tutorials
 
@@ -182,7 +176,7 @@ We are on a quest towards fully open source AI.
 Join us and start contributing, especially on the following areas:
 
 - [ ] [Pre-training](https://github.com/Lightning-AI/lit-gpt/labels/pre-training)
-- [ ] [Fine-tuning (full and adapter)](https://github.com/Lightning-AI/lit-gpt/labels/fine-tuning)
+- [ ] [Fine-tuning](https://github.com/Lightning-AI/lit-gpt/labels/fine-tuning)
 - [ ] [Quantization](https://github.com/Lightning-AI/lit-gpt/labels/quantization)
 - [ ] [Sparsification](https://github.com/Lightning-AI/lit-gpt/labels/sparsification)
 
