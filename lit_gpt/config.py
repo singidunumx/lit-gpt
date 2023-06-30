@@ -371,23 +371,26 @@ configs.extend(vicuna)
 ###############
 # MosaicML MPT
 ###############
-mosaicml = {
+# UNIMPLEMENTED FEATURES:
+# - initialization with `kaiming_normal_`
+# - tying wte embedding with lm_head
+mosaicml = [
     # https://huggingface.co/mosaicml/mpt-7b/blob/main/config.json
-    "mpt-7b": dict(
+    dict(
+        org="mosaicml",
+        name="mpt-7b",
         block_size=2048,
         padded_vocab_size=50432,
         n_layer=32,
         n_head=32,
         n_embd=4096,
-        alibi=True,
+        pos_encoding="ALiBi",
         parallel_residual=False,
         bias=False,
-        intermediate_size=8640,
-        # initialization is done with kaiming_normal_. this is not implemented
     ),
     # FIXME
-}
-configs.update(mosaicml)
+]
+configs.extend(mosaicml)
 
 
 name_to_config = {config["name"]: config for config in configs}

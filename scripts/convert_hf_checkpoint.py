@@ -169,6 +169,40 @@ def copy_weights_open_llama(
         del qkv_weights[i]
 
 
+def copy_weights_mpt(
+    state_dict: Dict[str, torch.Tensor],
+    hf_weights: Dict[str, Union[torch.Tensor, NotYetLoadedTensor]],
+    saver: Optional[incremental_save] = None,
+    dtype: torch.dtype = torch.float32,
+) -> None:
+    weight_map = {
+        "transformer.wte.weight": "transformer.wte.weight",
+        "transformer.blocks.{}.norm_1.weight": "transformer.h.{}.norm_1.weight",
+        "transformer.blocks.{}.attn.Wqkv.weight": "transformer.h.{}.attn.attn.weight",
+        "transformer.blocks.{}.attn.out_proj.weight": "transformer.h.{}.attn.proj.weight",
+        "transformer.blocks.{}.norm_2.weight": "transformer.h.{}.norm_2.weight",
+        "transformer.blocks.{}.ffn.up_proj.weight": "transformer.h.{}.mlp.fc.weight",
+        "transformer.blocks.{}.ffn.down_proj.weight": "transformer.h.{}.mlp.proj.weight",
+        "transformer.norm_f.weight": "transformer.ln_f.weight",
+        # FIXME: layernorm biases are missing?
+    }
+
+    for name, param in hf_weights.items():
+        if "transformer.blocks" in name:
+            from_name, number = layer_template(name, 2)
+            to_name = weight_map[from_name]
+            if to_name is None:
+                continue
+            to_name = to_name.format(number)
+        else:
+            to_name = weight_map[name]
+        param = load_param(param, dtype)
+        if saver is not None:
+            param = saver.store_early(param)
+        state_dict[to_name] = param
+    state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"]
+
+
 def layer_template(layer_name: str, idx: int) -> Tuple[str, int]:
     split = layer_name.split(".")
     number = int(split[idx])
@@ -210,6 +244,8 @@ def convert_hf_checkpoint(
         # holder to reconstitute the split q, k, v
         qkv_weights = {}
         copy_fn = partial(copy_weights_open_llama, config, qkv_weights)
+    elif config.name.startswith("mpt"):
+        copy_fn = copy_weights_mpt
     else:
         copy_fn = copy_weights_gpt_neox
 
