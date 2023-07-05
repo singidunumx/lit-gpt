@@ -113,8 +113,12 @@ def main(fabric, resume) -> None:
         "step_count": 0,
     }
 
+    # For fault-tolerant training on the Lightning AI platform
+    lightning_resume_dir = os.environ.get("LIGHTNING_RESUME_DIR")
+
     if resume is True:
-        resume = sorted(out_dir.glob("*.pth"))[-1]
+        checkpoint_dir = Path(out_dir, lightning_resume_dir) if lightning_resume_dir else out_dir
+        resume = sorted(checkpoint_dir.glob("*.pth"))[-1]
     if resume:
         fabric.print(f"Resuming training from {resume}")
         fabric.load(resume, state)
