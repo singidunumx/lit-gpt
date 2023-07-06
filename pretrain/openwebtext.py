@@ -119,8 +119,10 @@ def main(fabric, resume) -> None:
     lightning_resume_dir = os.environ.get("LIGHTNING_RESUME_DIR")
 
     if resume is True:
-        checkpoint_dir = Path(out_dir, lightning_resume_dir) if lightning_resume_dir else out_dir
-        resume = sorted(checkpoint_dir.glob("*.pth"))[-1]
+        checkpoint_dir = Path(lightning_resume_dir, "lit-gpt", out_dir) if lightning_resume_dir else out_dir
+        print("Looking for checkpoints in", checkpoint_dir)
+        resume = sorted(checkpoint_dir.glob("*.pth"))
+        resume = resume[-1] if resume else False
     if resume:
         fabric.print(f"Resuming training from {resume}")
         fabric.load(resume, state)
