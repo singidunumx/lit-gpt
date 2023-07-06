@@ -19,7 +19,7 @@ sys.path.append(str(wd))
 from lit_gpt import Config
 from lit_gpt.model import GPT, Block
 from lit_gpt.speed_monitor import SpeedMonitor, measure_flops, estimate_flops
-from lit_gpt.utils import step_csv_logger, chunked_cross_entropy
+from lit_gpt.utils import step_csv_logger, chunked_cross_entropy, get_resume_dir
 
 model_name = "pythia-70m"
 name = "openwebtext"
@@ -114,11 +114,8 @@ def main(fabric, resume) -> None:
         "step_count": 0,
     }
 
-    # For fault-tolerant training on the Lightning AI platform
-    lightning_resume_dir = os.environ.get("LIGHTNING_RESUME_DIR")
-
     if resume is True:
-        checkpoint_dir = Path(lightning_resume_dir, "lit-gpt", out_dir) if lightning_resume_dir else out_dir
+        checkpoint_dir = get_resume_dir(out_dir)
         print("Looking for checkpoints in", checkpoint_dir)
         resume = sorted(checkpoint_dir.glob("*.pth"))
         resume = resume[-1] if resume else False
