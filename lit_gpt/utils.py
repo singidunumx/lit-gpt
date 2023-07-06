@@ -1,5 +1,6 @@
 """Utility functions for training and inference."""
 
+import os
 import functools
 import pickle
 import sys
@@ -434,3 +435,10 @@ def chunked_cross_entropy(
         for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
     ]
     return torch.cat(loss_chunks).mean()
+
+
+def get_resume_dir(out_dir: Path) -> Path:
+    # For automatic resuming with Lightning AI
+    lightning_resume_dir = os.environ.get("LIGHTNING_RESUME_DIR", Path.home())
+    out_dir = Path(out_dir).absolute().relative_to(Path.home())
+    return Path(lightning_resume_dir, out_dir)

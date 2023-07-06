@@ -8,6 +8,7 @@ from io import StringIO
 
 import pytest
 import torch
+from unittest import mock
 
 
 class ATensor(torch.Tensor):
@@ -152,3 +153,24 @@ def test_chunked_cross_entropy(B):
 
     chunked_y = chunked_cross_entropy(chunked_logits, targets, chunk_size=10)
     torch.testing.assert_close(chunked_y, regular_y)
+
+
+def test_resume_dir(monkeypatch, tmp_path):
+    from lit_gpt.utils import get_resume_dir
+
+    home1 = tmp_path / "home1"
+    home2 = tmp_path / "home2"
+
+    (home1 / "subdir").mkdir(parents=True)
+    (home2 / "subdir").mkdir(parents=True)
+    
+    monkeypatch.chdir(home1 / "subdir")
+    with mock.patch("pathlib.Path.home", return_value=home1):
+        resume_dir = get_resume_dir("a/b/c")
+    assert resume_dir == pathlib.Path(home1, "subdir", "a/b/c")
+
+    # Reference folder under home 1 while being in home 2
+    monkeypatch.chdir(home2 / "subdir")
+    with mock.patch.dict(os.environ, {"LIGHTNING_RESUME_DIR": str(home1)}), mock.patch("pathlib.Path.home", return_value=home2):
+        resume_dir = get_resume_dir("a/b/c")
+    assert resume_dir == pathlib.Path(home1, "subdir", "a/b/c")
