@@ -81,8 +81,7 @@ def setup(
 
 
 def main(fabric, resume) -> None:
-    # speed_monitor = SpeedMonitor(fabric, window_size=50, time_unit="seconds")
-    speed_monitor = None
+    speed_monitor = SpeedMonitor(fabric, window_size=50, time_unit="seconds")
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
@@ -189,14 +188,14 @@ def train(fabric, state, train_data, val_data, speed_monitor):
 
         t1 = time.time()
         total_lengths += input_ids.size(1)
-        # speed_monitor.on_train_batch_end(
-        #     (state["iter_num"] + 1) * micro_batch_size,
-        #     t1 - total_t0,
-        #     # this assumes that device FLOPs are the same and that all devices have the same batch size
-        #     fabric.world_size,
-        #     flops_per_batch=measured_flops,
-        #     lengths=total_lengths,
-        # )
+        speed_monitor.on_train_batch_end(
+            (state["iter_num"] + 1) * micro_batch_size,
+            t1 - total_t0,
+            # this assumes that device FLOPs are the same and that all devices have the same batch size
+            fabric.world_size,
+            flops_per_batch=measured_flops,
+            lengths=total_lengths,
+        )
         if state["iter_num"] % log_interval == 0:
             fabric.print(
                 f"iter {state['iter_num']} step {state['step_count']}: loss {loss.item():.4f}, iter time:"
@@ -207,7 +206,7 @@ def train(fabric, state, train_data, val_data, speed_monitor):
             t0 = time.time()
             val_loss = validate(fabric, model, val_data)
             t1 = time.time() - t0
-            # speed_monitor.eval_end(t1)
+            speed_monitor.eval_end(t1)
             fabric.print(f"step {state['iter_num']}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
             fabric.barrier()
         if not is_accumulating and state["step_count"] % save_interval == 0:
