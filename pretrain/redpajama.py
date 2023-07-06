@@ -24,7 +24,7 @@ from lit_gpt.speed_monitor import SpeedMonitor, estimate_flops, measure_flops
 model_name = "pythia-70m"
 name = "redpajama"
 out_dir = Path("out") / name
-save_interval = 10
+save_interval = 10  # FIXME
 eval_interval = 1000
 eval_iters = 100
 log_interval = 1
