@@ -19,63 +19,50 @@
 
 # ⚡ Lit-GPT
 
-Hackable [implementation](lit_gpt/model.py) of state-of-the-art open-source large language models released under the **Apache 2.0 license**.
+Fast, simple implementations of state-of-the-art large language models (LLM).
 
-Supports popular public checkpoints such as:
+With Lit-GPT you can:
 
-- TII UAE [Falcon](tutorials/download_falcon.md)
-- OpenLM Research [OpenLLaMA](tutorials/download_openllama.md)
-- LMSYS [Vicuna](tutorials/download_vicuna.md) and [LongChat](tutorials/download_longchat.md)
-- Together [RedPajama-INCITE](tutorials/download_redpajama_incite.md)
-- EleutherAI [Pythia](tutorials/download_pythia.md)
-- StabilityAI [StableLM](tutorials/download_stablelm.md)
+* generate text or code, or make your documents interactive
+* fine-tune models on your own data on your own hardware
+* train brand new models from scratch on your datasets of choice
 
-This implementation extends on [Lit-LLaMA](https://github.com/lightning-AI/lit-llama) and [nanoGPT](https://github.com/karpathy/nanoGPT), and it's **powered by [Lightning Fabric](https://lightning.ai/docs/fabric/stable/) ⚡**.
+Lit-GPT can run on your own device or scale up to large clusters, thanks to [Lightning Fabric](https://lightning.ai/docs/fabric/stable/) ⚡.
 
-## Design principles
+## Get started
 
-This repository follows the main principle of **openness through clarity**.
+Get started in minutes:
 
-**Lit-GPT** is:
-
-- **Simple:** Single-file implementation without boilerplate.
-- **Correct:** Numerically equivalent to the original model.
-- **Optimized:** Runs fast on consumer hardware or at scale.
-- **Open-source:** No strings attached.
-
-Avoiding code duplication is **not** a goal. **Readability** and **hackability** are.
-
-## Get involved!
-
-[Join our Discord](https://discord.gg/VptPCZkGNa) to build high-performance, truly open-source models for the common benefit of the community.
-
-&nbsp;
+* [Setup the repo](#setup)
+* [Get a checkpoint](#get-a-checkpoint)
+* Generate
+* Fine-tune
+* Pretrain
 
 ## Setup
 
-Clone the repo
+**Clone the repo**
 
 ```bash
 git clone https://github.com/Lightning-AI/lit-gpt
 cd lit-gpt
 ```
 
-Lit-GPT currently relies on flash attention from PyTorch nightly. Until PyTorch 2.1 is released you'll need to install nightly manually.
-Luckily that is straightforward:
+Lit-GPT currently relies on PyTorch nightly. Until PyTorch 2.1 is released you'll need to install nightly manually:
 
-**On CUDA**
+**On GPU**
 
 ```bash
-pip install --index-url https://download.pytorch.org/whl/nightly/cu118 --pre 'torch>=2.1.0dev'
+pip install -r requirements/pytorch_nightly_gpu.txt
 ```
 
 **On CPU (incl Macs)**
 
 ```bash
-pip install --index-url https://download.pytorch.org/whl/nightly/cpu --pre 'torch>=2.1.0dev'
+pip install -r requirements/pytorch_nightly_cpu.txt
 ```
 
-All good, now install the dependencies:
+All good, now **install the dependencies**:
 
 ```bash
 pip install -r requirements.txt
@@ -83,11 +70,87 @@ pip install -r requirements.txt
 
 You are all set! 🎉
 
-&nbsp;
+## Get a checkpoint
+
+In order to use Lit-GPT to generate and fine-tune, you need to download a checkpoint to start from, and convert it so that it works with Lit-GPT.
+
+To download and conver, use this script and pass a checkpoint to it:
+
+```bash
+python scripts/download_and_convert.py --checkpoint <checkpoint>
+```
+
+For instance, to download and convert the OpenLLaMA 7B checkpoint do:
+
+```bash
+python scripts/download_and_convert.py --checkpoint openlm-research/open_llama_7b
+```
+
+Here's a list of all checkpoints supported by Lit-GPT along with their checkpoint id:
+
+<!--
+| Model | Description | Checkpoints |
+| -- | -- | -- | -- | -- |
+| [Falcon](tutorials/download_falcon.md)    | GPT-like model trained on [RefinedWeb](https://huggingface.co/datasets/tiiuae/falcon-refinedweb) | `tiiuae/falcon-7b` <br/> `tiiuae/falcon-7b-instruct` <br/> `tiiuae/falcon-40b` <br/> `tiiuae/falcon-40b-instruct` |
+| [OpenLLaMA](tutorials/download_openllama.md)        | Open source LLaMA trained on [RedPajama](https://www.together.xyz/blog/redpajama) | `openlm-research/open_llama_3b` <br/> `openlm-research/open_llama_7b` <br/> `openlm-research/open_llama_13b` |
+| [Vicuna](tutorials/download_vicuna.md)           | LLaMA fine-tuned on conversation | `lmsys/vicuna-7b-v1.3` <br/> `lmsys/vicuna-13b-v1.3` <br/> `lmsys/vicuna-33b-v1.3` |
+| [LongChat](tutorials/download_longchat.md)         | LLaMA fine-tuned on long context lengths (16k) | `lmsys/longchat-7b-16k` <br/> `lmsys/longchat-13b-16k` |
+| [RedPajama-INCITE](tutorials/download_redpajama_incite.md) | GPT-like model trained on [RedPajama](https://www.together.xyz/blog/redpajama) | `togethercomputer/RedPajama-INCITE-7B-Base` <br/> `togethercomputer/RedPajama-INCITE-7B-Chat` <br/> `togethercomputer/RedPajama-INCITE-7B-Instruct`
+| [StableLM](tutorials/download_stablelm.md)         | GPT-like model trained on [The Pile](https://pile.eleuther.ai) | `stabilityai/stablelm-base-alpha-3b` <br/> `stabilityai/stablelm-tuned-alpha-3b` <br/> `stabilityai/stablelm-base-alpha-7b` <br/> `stabilityai/stablelm-tuned-alpha-7b`
+| [Pythia](tutorials/download_pythia.md)           | Collection of models trained on [The Pile](https://pile.eleuther.ai) | `EleutherAI/pythia-70m` <br/> `EleutherAI/pythia-160m` <br/> `EleutherAI/pythia-410m` <br/> `EleutherAI/pythia-1b` <br/> `EleutherAI/pythia-1.4b` <br/> `EleutherAI/pythia-2.8b` <br/> `EleutherAI/pythia-6.9b` <br/> `EleutherAI/pythia-12b`
+-->
+
+| Model | Description | Recommended | More options |
+| -- | -- | -- | -- | -- |
+| [OpenLLaMA](tutorials/download_openllama.md) | Open-source LLaMA trained on [RedPajama](https://www.together.xyz/blog/redpajama) | `openlm-research/open_llama_7b` | <details> <summary> view all checkpoints </summary> `openlm-research/open_llama_3b` <br/> `openlm-research/open_llama_7b` <br/> `openlm-research/open_llama_13b` </details> |
+| [Vicuna](tutorials/download_vicuna.md) | LLaMA fine-tuned on conversation | `lmsys/vicuna-7b-v1.3` | <details> <summary> view all checkpoints </summary> `lmsys/vicuna-7b-v1.3` <br/> `lmsys/vicuna-13b-v1.3` <br/> `lmsys/vicuna-33b-v1.3` </details> |
+| [LongChat](tutorials/download_longchat.md) | LLaMA fine-tuned on long context lengths (16k) | `lmsys/longchat-7b-16k` | <details> <summary> view all checkpoints </summary> `lmsys/longchat-7b-16k` <br/> `lmsys/longchat-13b-16k` </details> |
+| [Falcon](tutorials/download_falcon.md) | GPT-like model trained on [RefinedWeb](https://huggingface.co/datasets/tiiuae/falcon-refinedweb) | `tiiuae/falcon-7b-instruct` | <details> <summary> view all checkpoints </summary> `tiiuae/falcon-7b` <br/> `tiiuae/falcon-7b-instruct` <br/> `tiiuae/falcon-40b` <br/> `tiiuae/falcon-40b-instruct` </details> |
+| [RedPajama-INCITE](tutorials/download_redpajama_incite.md) | GPT-like model trained on [RedPajama](https://www.together.xyz/blog/redpajama) | `togethercomputer/RedPajama-INCITE-7B-Instruct` | <details> <summary> view all checkpoints </summary> `togethercomputer/RedPajama-INCITE-7B-Base` <br/> `togethercomputer/RedPajama-INCITE-7B-Chat` <br/> `togethercomputer/RedPajama-INCITE-7B-Instruct` </details> |
+| [StableLM](tutorials/download_stablelm.md) | GPT-like model trained on [The Pile](https://pile.eleuther.ai) | `stabilityai/stablelm-tuned-alpha-3b` | <details> <summary> view all checkpoints </summary> `stabilityai/stablelm-base-alpha-3b` <br/> `stabilityai/stablelm-tuned-alpha-3b` <br/> `stabilityai/stablelm-base-alpha-7b` <br/> `stabilityai/stablelm-tuned-alpha-7b` </details> |
+| [Pythia](tutorials/download_pythia.md) | GPT-like model trained on [The Pile](https://pile.eleuther.ai) | `EleutherAI/pythia-6.9b` | <details> <summary> view all checkpoints </summary> `EleutherAI/pythia-70m` <br/> `EleutherAI/pythia-160m` <br/> `EleutherAI/pythia-410m` <br/> `EleutherAI/pythia-1b` <br/> `EleutherAI/pythia-1.4b` <br/> `EleutherAI/pythia-2.8b` <br/> `EleutherAI/pythia-6.9b` <br/> `EleutherAI/pythia-12b` </details> |
+
+If you don't find your favorite checkpoint and the model family is the same (e.g. LLaMA, GPTNeoX, Falcon), then adding it to the supported checkpoints is going to be quick. Please post an issue about it!
+
+## Generate
+
+Got your checkpoint? Great, you can now have a conversation with Lit-GPT:
+
+```bash
+python generate/base.py --prompt "Hello, my name is" --checkpoint openlm-research/open_llama_7b
+```
+
+This will run the 3B pre-trained model and require ~7 GB of GPU memory using the `bfloat16` datatype.
+
+You can also chat with the model interactively:
+
+```bash
+python chat/base.py
+```
+
+For more options for generation, including quantization to run large models on consumer devices, follow [this tutorial](tutorials/inference.md).
+
+## Design principles
+
+The Lit-GPT codebase builds on top of [Lit-LLaMA](https://github.com/lightning-AI/lit-llama) and [nanoGPT](https://github.com/karpathy/nanoGPT), and it's **powered by [Lightning Fabric](https://lightning.ai/docs/fabric/stable/) ⚡**.
+
+
+This repository follows the main principle of **openness through clarity**.
+
+**Lit-GPT** is:
+
+- **Simple:** Single-file implementation without boilerplate.
+- **Correct:** Numerically equivalent to the original models.
+- **Optimized:** Runs fast on consumer hardware or at scale.
+- **Open-source:** Apache 2.0, no strings attached.
+
+Avoiding code duplication is **not** a goal. **Readability** and **hackability** are.
+
+## Get involved!
+
+[Join our Discord](https://discord.gg/VptPCZkGNa) to build high-performance, truly open-source models for the common benefit of the community.
 
 ## Use the model
-
-To generate text predictions, you need to download the model weights. **If you don't have them, check out our [guide](tutorials/download_stablelm.md).**
 
 Run inference:
 
