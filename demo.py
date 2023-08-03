@@ -43,10 +43,10 @@ hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str))
 
 
 def setup(
-    data_dir: Path = Path("data/alpaca-pythia"),
+    data_dir: Path = Path("data/alpaca-vicuna"),
     checkpoint_dir: Path = Path("checkpoints/lmsys/vicuna-13b-v1.3"),
     out_dir: Path = Path("out/full/alpaca"),
-    precision: Optional[str] = "bf16-true",
+    precision: Optional[str] = "bf16-mixed",
     tpu: bool = False,
 ):
     if precision is None:
@@ -89,13 +89,12 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
 
     config = Config.from_name(name=checkpoint_dir.name)
     checkpoint_path = checkpoint_dir / "lit_model.pth"
-    fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
     t0 = time.time()
     
     with fabric.init_module(empty_init=True):
         model = GPT(config)
     
-    fabric.print("Time to init model:", time.time() - t0)
+    fabric.print(f"Time to init model: {time.time() - t0:.2f} seconds")
     
     num_params = sum(p.numel() for p in model.parameters())
     fabric.print(f"Number of trainable parameters: {num_params:,}")
@@ -104,12 +103,13 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     model = fabric.setup_module(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     optimizer = fabric.setup_optimizers(optimizer)
-    fabric.print("Time to shard model:", time.time() - t0)
+    fabric.print(f"Time to shard model: {time.time() - t0:.2f} seconds")
 
     fabric.print("Loading checkpoint:", checkpoint_path)
     t0 = time.time()
     fabric.load_raw(checkpoint_path, model)
-    fabric.print("Time to load checkpoint:", time.time() - t0)
+    # torch.load(checkpoint_path)
+    fabric.print(f"Time to load checkpoint: {time.time() - t0:.2f} seconds")
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
