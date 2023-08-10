@@ -115,7 +115,7 @@ def main(fabric, train_data_dir, val_data_dir, resume):
 
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.time()
-    with fabric.init_module(empty_init=False):
+    with fabric.init_module(empty_init=True):
         model = GPT(config)
         model.apply(model._init_weights)
     
