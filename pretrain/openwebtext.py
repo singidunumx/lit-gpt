@@ -93,10 +93,12 @@ def main(fabric, resume) -> None:
     num_total_params = sum(p.numel() for p in model.parameters())
     fabric.print(f"Total parameters {num_total_params}")
 
+    model = fabric.setup(model)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
     )
-    model, optimizer = fabric.setup(model, optimizer)
+    optimizer = fabric.setup_optimizers(optimizer)
+
 
     train_data, val_data = load_datasets(data_dir, block_size=model.config.block_size)
     train_dataloader = DataLoader(train_data, batch_size=micro_batch_size, num_workers=2)
