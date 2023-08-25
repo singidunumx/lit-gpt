@@ -185,7 +185,8 @@ class CausalSelfAttention(nn.Module):
         self.config = config
 
         self.register_buffer(
-            "bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+            "bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size),
+            persistent=False,
         )
 
     def forward(
