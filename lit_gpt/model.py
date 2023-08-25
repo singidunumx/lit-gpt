@@ -184,6 +184,10 @@ class CausalSelfAttention(nn.Module):
 
         self.config = config
 
+        self.register_buffer(
+            "bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -237,7 +241,15 @@ class CausalSelfAttention(nn.Module):
             v = cache_v.index_copy_(2, input_pos, v)
             kv_cache = k, v
 
-        y = self.scaled_dot_product_attention(q, k, v, mask=mask)
+        y_old = self.scaled_dot_product_attention(q, k, v, mask=mask)
+        print("old", y_old.shape)
+        # manual implementation of attention
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = torch.nn.functional.softmax(att, dim=-1)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous()
+        print("new", y.shape)
 
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
 
