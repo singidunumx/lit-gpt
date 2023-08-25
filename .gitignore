@@ -13,3 +13,8 @@ out
 wandb
 
 tests/original_falcon_40b.py
+
+neuronxcc*
+
+*.csv
+*.txt

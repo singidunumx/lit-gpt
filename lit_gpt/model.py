@@ -3,11 +3,13 @@
 Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT and
 https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 """
+
 import math
 from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
 
@@ -17,6 +19,7 @@ RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
+TorchScaledDotProductAvailable = RequirementCache("torch>=2.0.0")
 
 
 class GPT(nn.Module):
@@ -182,6 +185,10 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
+        if not TorchScaledDotProductAvailable and not FlashAttention2Available:
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
         self.config = config
 
     def forward(
@@ -263,10 +270,22 @@ class CausalSelfAttention(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
-        )
-        return y.transpose(1, 2)
+        elif TorchScaledDotProductAvailable:
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
+            )
+        else:
+            y = scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout=0.0, scale=scale, bias=self.bias)
+        return y.transpose(1, 2).contiguous()
+
+def scaled_dot_product_attention(q, k, v, attn_mask, dropout, scale, bias):
+    assert attn_mask is None
+    T = v.size(-2)
+    att = (q @ k.transpose(-2, -1)) * scale
+    att = att.masked_fill(bias[:,:,:T,:T] == 0, float('-inf'))
+    att = F.softmax(att, dim=-1)
+    y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+    return y
 
 
 class GptNeoxMLP(nn.Module):

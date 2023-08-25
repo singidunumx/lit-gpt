@@ -1,8 +1,11 @@
+import os
+os.environ['NEURON_CC_FLAGS'] = os.environ.get('NEURON_CC_FLAGS', '') + ' --cache_dir=/teamspace/studios/this_studio/neuron_compile_cache'
+
 import math
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import lightning as L
 import numpy as np
@@ -18,7 +21,7 @@ sys.path.append(str(wd))
 
 from lit_gpt import Config
 from lit_gpt.model import GPT, Block
-from lit_gpt.speed_monitor import SpeedMonitorCallback, estimate_flops, measure_flops
+# from lit_gpt.speed_monitor import SpeedMonitorCallback, estimate_flops, measure_flops
 from lit_gpt.utils import chunked_cross_entropy, get_default_supported_precision, step_csv_logger
 
 model_name = "pythia-70m"
@@ -64,18 +67,18 @@ class LightningGPTModule(L.LightningModule):
             self.module.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
         )
 
-    def on_fit_start(self) -> None:
-        trainer = self.trainer
-        with torch.device("meta"):
-            meta_model = GPT(self.module.config)
-            # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
-            # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
-            # consider setting `self.measured_flops = estimated_flops` instead
-            estimated_flops = estimate_flops(meta_model) * micro_batch_size
-            self.print(f"Estimated TFLOPs: {estimated_flops * trainer.world_size / 1e12:.2f}")
-            x = torch.randint(0, 1, (micro_batch_size, meta_model.config.block_size))
-            self.measured_flops = measure_flops(meta_model, x)
-            self.print(f"Measured TFLOPs: {self.measured_flops * trainer.world_size / 1e12:.2f}")
+    # def on_fit_start(self) -> None:
+    #     trainer = self.trainer
+    #     with torch.device("meta"):
+    #         meta_model = GPT(self.module.config)
+    #         # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
+    #         # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
+    #         # consider setting `self.measured_flops = estimated_flops` instead
+    #         estimated_flops = estimate_flops(meta_model) * micro_batch_size
+    #         self.print(f"Estimated TFLOPs: {estimated_flops * trainer.world_size / 1e12:.2f}")
+    #         x = torch.randint(0, 1, (micro_batch_size, meta_model.config.block_size))
+    #         self.measured_flops = measure_flops(meta_model, x)
+    #         self.print(f"Measured TFLOPs: {self.measured_flops * trainer.world_size / 1e12:.2f}")
 
     def on_train_batch_start(self, batch: Any, batch_idx: int) -> None:
         if not decay_lr:
@@ -100,10 +103,10 @@ class LightningGPTModule(L.LightningModule):
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
 
-def main(devices: int = 1, precision: Optional[str] = None, tpu: bool = False) -> None:
+def main(devices: Union[int, str] = 1, precision: Optional[str] = None, tpu: bool = False) -> None:
     precision = precision or get_default_supported_precision(training=True, tpu=tpu)
 
-    if devices > 1:
+    if isinstance(devices, int) and devices > 1:
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
             devices = "auto"
@@ -121,24 +124,29 @@ def main(devices: int = 1, precision: Optional[str] = None, tpu: bool = False) -
         strategy = "auto"
 
     logger = step_csv_logger("out", name, cls=CSVLogger, flush_logs_every_n_steps=log_interval)
-    speed_monitor = SpeedMonitorCallback(
-        length_fn=lambda batch: batch[0].size(1), batch_size=micro_batch_size, window_size=50, time_unit="seconds"
-    )
+    # speed_monitor = SpeedMonitorCallback(
+    #     length_fn=lambda batch: batch[0].size(1), batch_size=micro_batch_size, window_size=50, time_unit="seconds"
+    # )
     model_checkpoint = ModelCheckpoint(dirpath=out_dir, every_n_train_steps=save_interval, save_last=True, verbose=True)
     trainer = L.Trainer(
+        barebones=True,
         devices=devices,
         strategy=strategy,
         precision=precision,
-        logger=logger,
-        callbacks=[speed_monitor, model_checkpoint],
+        # logger=logger,
+        # callbacks=[
+        #     # speed_monitor, 
+        #     model_checkpoint,
+        #     ],
         max_steps=max_iters,
         max_epochs=1,
         limit_val_batches=eval_iters,
-        accumulate_grad_batches=gradient_accumulation_steps,
-        log_every_n_steps=log_interval,
+        # accumulate_grad_batches=gradient_accumulation_steps,
+        # log_every_n_steps=log_interval,
         val_check_interval=eval_interval,
     )
 
+    print(trainer.strategy)
     L.seed_everything(1337, workers=True)  # same seed for every process to init model (FSDP)
 
     trainer.print(hparams)

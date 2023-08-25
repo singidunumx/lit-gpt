@@ -1,3 +1,9 @@
+import os
+
+os.environ['NEURON_CC_FLAGS'] = os.environ.get('NEURON_CC_FLAGS', '') + ' --retry_failed_compilation'
+os.environ["NEURON_RT_LOG_LEVEL"] = "INFO"
+os.environ['NEURON_CC_FLAGS'] = os.environ.get('NEURON_CC_FLAGS', '') + ' --cache_dir=/teamspace/studios/this_studio/neuron_compile_cache'
+
 import math
 import sys
 import time
@@ -16,8 +22,8 @@ sys.path.append(str(wd))
 
 from lit_gpt import Config
 from lit_gpt.model import GPT, Block
-from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor
-from lit_gpt.speed_monitor import estimate_flops, measure_flops
+# from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor
+# from lit_gpt.speed_monitor import estimate_flops, measure_flops
 from lit_gpt.utils import chunked_cross_entropy, get_default_supported_precision, num_parameters, step_csv_logger
 
 model_name = "pythia-70m"
@@ -31,7 +37,7 @@ log_interval = 1
 
 # Hyperparameters
 learning_rate = 6e-4
-batch_size = 125
+batch_size = 5
 micro_batch_size = 5
 gradient_accumulation_steps = batch_size // micro_batch_size
 assert gradient_accumulation_steps > 0
@@ -76,7 +82,8 @@ def setup(
 
 
 def main(fabric, resume) -> None:
-    speed_monitor = SpeedMonitor(fabric, window_size=50, time_unit="seconds")
+    speed_monitor=None
+    # speed_monitor = SpeedMonitor(fabric, window_size=50, time_unit="seconds")
 
     if fabric.global_rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -125,17 +132,17 @@ def train(fabric, state, train_dataloader, val_dataloader, speed_monitor):
 
     validate(fabric, model, val_dataloader)  # sanity check
 
-    with torch.device("meta"):
-        meta_model = GPT(model.config)
-        # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
-        # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
-        # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead
-        estimated_flops = estimate_flops(meta_model) * micro_batch_size
-        fabric.print(f"Estimated TFLOPs: {estimated_flops * fabric.world_size / 1e12:.2f}")
-        x = torch.randint(0, 1, (micro_batch_size, model.config.block_size))
-        measured_flops = measure_flops(meta_model, x)
-        fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
-        del meta_model, x
+    # with torch.device("meta"):
+    #     meta_model = GPT(model.config)
+    #     # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
+    #     # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
+    #     # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead
+    #     estimated_flops = estimate_flops(meta_model) * micro_batch_size
+    #     fabric.print(f"Estimated TFLOPs: {estimated_flops * fabric.world_size / 1e12:.2f}")
+    #     x = torch.randint(0, 1, (micro_batch_size, model.config.block_size))
+    #     measured_flops = measure_flops(meta_model, x)
+    #     fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
+    #     del meta_model, x
 
     total_lengths = 0
     total_t0 = time.perf_counter()
@@ -164,7 +171,7 @@ def train(fabric, state, train_dataloader, val_dataloader, speed_monitor):
             fabric.backward(loss / gradient_accumulation_steps)
 
         if not is_accumulating:
-            fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
+            # fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
@@ -173,17 +180,21 @@ def train(fabric, state, train_dataloader, val_dataloader, speed_monitor):
 
         t1 = time.perf_counter()
         total_lengths += input_ids.size(1)
-        speed_monitor.on_train_batch_end(
-            (state["iter_num"] + 1) * micro_batch_size,
-            t1 - total_t0,
-            # this assumes that device FLOPs are the same and that all devices have the same batch size
-            fabric.world_size,
-            flops_per_batch=measured_flops,
-            lengths=total_lengths,
-        )
+        # speed_monitor.on_train_batch_end(
+        #     (state["iter_num"] + 1) * micro_batch_size,
+        #     t1 - total_t0,
+        #     # this assumes that device FLOPs are the same and that all devices have the same batch size
+        #     fabric.world_size,
+        #     flops_per_batch=measured_flops,
+        #     lengths=total_lengths,
+        # )
         if state["iter_num"] % log_interval == 0:
-            fabric.print(
-                f"iter {state['iter_num']} step {state['step_count']}: loss {loss.item():.4f}, iter time:"
+            # print(
+            #     f"iter {state['iter_num']} step {state['step_count']}: loss {loss.item():.4f}, iter time:"
+            #     f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
+            # )
+            print(
+                f"iter {state['iter_num']} step {state['step_count']}: iter time:"
                 f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
             )
 
@@ -191,18 +202,18 @@ def train(fabric, state, train_dataloader, val_dataloader, speed_monitor):
             t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_dataloader)
             t1 = time.perf_counter() - t0
-            speed_monitor.eval_end(t1)
-            fabric.print(f"step {state['iter_num']}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
+            # speed_monitor.eval_end(t1)
+            print(f"step {state['iter_num']}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
             fabric.barrier()
-        if not is_accumulating and state["step_count"] % save_interval == 0:
-            checkpoint_path = out_dir / f"iter-{state['iter_num']:06d}-ckpt.pth"
-            fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
-            fabric.save(checkpoint_path, state)
+        # if not is_accumulating and state["step_count"] % save_interval == 0:
+        #     checkpoint_path = out_dir / f"iter-{state['iter_num']:06d}-ckpt.pth"
+        #     fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
+        #     fabric.save(checkpoint_path, state)
 
 
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: torch.nn.Module, val_dataloader: DataLoader) -> torch.Tensor:
-    fabric.print("Validating ...")
+    print("Validating ...")
     model.eval()
     val_iter = iter(val_dataloader)
 

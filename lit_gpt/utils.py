@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Mapping, Optional, Type, TypeVar, Union
 
 import torch
 import torch.nn as nn
-import torch.utils._device
 from lightning.fabric.loggers import CSVLogger
 from torch.serialization import normalize_storage_type
 
