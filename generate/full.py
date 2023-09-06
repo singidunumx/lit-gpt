@@ -68,9 +68,6 @@ def main(
     with open(checkpoint_dir / "lit_config.json") as fp:
         config = Config(**json.load(fp))
 
-    if quantize is not None:
-        # TODO: we need to clean-up the logic for quantizing the finetuned models and loading them after
-        raise NotImplementedError
     checkpoint_path = finetuned_path
 
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)

@@ -90,8 +90,6 @@ def main(
         config_params.update(**json.load(fp))
         config = Config(**config_params)
 
-    if quantize is not None and devices > 1:
-        raise NotImplementedError
     if quantize == "gptq.int4":
         model_file = "lit_model_gptq.4bit.pth"
         if not (checkpoint_dir / model_file).is_file():
