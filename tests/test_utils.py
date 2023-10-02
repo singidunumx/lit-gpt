@@ -1,7 +1,5 @@
 import os
-import pathlib
 import sys
-import tempfile
 from contextlib import redirect_stderr
 from io import StringIO
 
@@ -78,6 +76,7 @@ def test_incremental_write(tmp_path):
     from lit_gpt.utils import incremental_save
 
     sd = {str(k): torch.randn(5, 10) for k in range(3)}
+    sd["0"].someattr = 1
     sd_expected = {k: v.clone() for k, v in sd.items()}
     fn = str(tmp_path / "test.pt")
     with incremental_save(fn) as f:
@@ -86,6 +85,7 @@ def test_incremental_write(tmp_path):
         f.save(sd)
     sd_actual = torch.load(fn)
     assert sd_actual.keys() == sd_expected.keys()
+    assert sd_actual["0"].someattr == 1  # requires PyTorch 2.0+
     for k, v_expected in sd_expected.items():
         v_actual = sd_actual[k]
         torch.testing.assert_close(v_expected, v_actual)
@@ -134,3 +134,16 @@ def test_num_parameters():
     assert num_parameters(model) == 6
     assert num_parameters(model, requires_grad=True) == 4
     assert num_parameters(model, requires_grad=False) == 2
+
+
+@pytest.mark.parametrize("mode", ("bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8"))
+def test_quantize_raises_when_bnb_unavailable(mode):
+    import quantize.bnb as bnb
+
+    if bnb._BITSANDBYTES_AVAILABLE:
+        pytest.skip("BNB needs to be unavailable")
+
+    from lit_gpt.utils import quantization
+
+    with pytest.raises(ModuleNotFoundError, match="bitsandbytes.*was not found"), quantization(mode):
+        pass

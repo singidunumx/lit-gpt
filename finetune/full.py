@@ -6,7 +6,8 @@ from typing import Dict, List, Optional, Tuple
 
 import lightning as L
 import torch
-from lightning.fabric.strategies import FSDPStrategy, XLAStrategy
+from lightning.fabric.loggers import CSVLogger
+from lightning.fabric.strategies import FSDPStrategy
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -21,18 +22,17 @@ from lit_gpt.utils import (
     check_valid_checkpoint_dir,
     chunked_cross_entropy,
     get_default_supported_precision,
+    load_checkpoint,
     num_parameters,
-    step_csv_logger,
 )
 from scripts.prepare_alpaca import generate_prompt
 
 eval_interval = 600
 save_interval = 1000
 eval_iters = 100
+eval_max_new_tokens = 100
 log_interval = 1
 devices = 1
-# change this value to force a maximum sequence length
-override_max_seq_length = None
 
 # Hyperparameters
 learning_rate = 3e-3
@@ -54,28 +54,22 @@ def setup(
     checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
     out_dir: Path = Path("out/full/alpaca"),
     precision: Optional[str] = None,
-    tpu: bool = False,
 ):
-    precision = precision or get_default_supported_precision(training=True, tpu=tpu)
+    precision = precision or get_default_supported_precision(training=True)
 
     fabric_devices = devices
     if fabric_devices > 1:
-        if tpu:
-            # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
-            fabric_devices = "auto"
-            strategy = XLAStrategy(sync_module_states=False)
-        else:
-            strategy = FSDPStrategy(
-                auto_wrap_policy={Block},
-                activation_checkpointing_policy={Block},
-                state_dict_type="full",
-                limit_all_gathers=True,
-                cpu_offload=False,
-            )
+        strategy = FSDPStrategy(
+            auto_wrap_policy={Block},
+            activation_checkpointing_policy={Block},
+            state_dict_type="full",
+            limit_all_gathers=True,
+            cpu_offload=False,
+        )
     else:
         strategy = "auto"
 
-    logger = step_csv_logger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
+    logger = CSVLogger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=logger)
     fabric.print(hparams)
     fabric.launch(main, data_dir, checkpoint_dir, out_dir)
@@ -97,16 +91,17 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     config = Config.from_name(name=checkpoint_dir.name)
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
-    with fabric.init_module(empty_init=True):
+    with fabric.init_module(empty_init=(devices > 1)):
         model = GPT(config)
-    checkpoint = torch.load(str(checkpoint_path), mmap=True)
-    model.load_state_dict(checkpoint, assign=True)
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
 
     model = fabric.setup_module(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, foreach=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     optimizer = fabric.setup_optimizers(optimizer)
+
+    checkpoint = torch.load(str(checkpoint_path), mmap=True)
+    model.load_state_dict(checkpoint, assign=True)
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
@@ -132,16 +127,24 @@ def train(
     speed_monitor: SpeedMonitor,
 ) -> None:
     tokenizer = Tokenizer(checkpoint_dir)
-    max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
+    longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
+    model.max_seq_length = longest_seq_length
+    fabric.print(
+        f"The longest sequence length in the train data is {longest_seq_length}, the model's maximum sequence length is"
+        f" {model.max_seq_length} and context length is {model.config.block_size}"
+    )
 
-    validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
+    validate(fabric, model, val_data, tokenizer)  # sanity check
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
-        # estimated is too much of an optimistic estimate, left just for reference
+        # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
+        # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
+        # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead
         estimated_flops = estimate_flops(meta_model) * micro_batch_size
         fabric.print(f"Estimated TFLOPs: {estimated_flops * fabric.world_size / 1e12:.2f}")
-        # TODO: this assumes that samples have a fixed length which is most likely false during finetuning
+        # this assumes that all samples have a fixed length equal to the longest sequence length
+        # which is most likely false during finetuning
         x = torch.randint(0, 1, (micro_batch_size, longest_seq_length))
         measured_flops = measure_flops(meta_model, x)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
@@ -151,10 +154,6 @@ def train(
     total_lengths = 0
     total_t0 = time.perf_counter()
 
-    if fabric.device.type == "xla":
-        import torch_xla.core.xla_model as xm
-
-        xm.mark_step()
     for iter_num in range(max_iters):
         if step_count <= warmup_steps:
             # linear warmup
@@ -164,13 +163,11 @@ def train(
 
         iter_t0 = time.perf_counter()
 
-        input_ids, targets = get_batch(
-            fabric, train_data, longest_seq_length, longest_seq_ix if iter_num == 0 else None
-        )
+        input_ids, targets = get_batch(fabric, train_data, longest_seq_ix if iter_num == 0 else None)
 
         is_accumulating = (iter_num + 1) % gradient_accumulation_iters != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids, max_seq_length=max_seq_length)
+            logits = model(input_ids)
             # shift the targets such that output n predicts token n+1
             loss = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
             fabric.backward(loss / gradient_accumulation_iters)
@@ -179,8 +176,6 @@ def train(
             optimizer.step()
             optimizer.zero_grad()
             step_count += 1
-        elif fabric.device.type == "xla":
-            xm.mark_step()
 
         t1 = time.perf_counter()
         total_lengths += input_ids.size(1)
@@ -200,28 +195,25 @@ def train(
 
         if not is_accumulating and step_count % eval_interval == 0:
             t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_data, tokenizer, longest_seq_length)
+            val_loss = validate(fabric, model, val_data, tokenizer)
             t1 = time.perf_counter() - t0
             speed_monitor.eval_end(t1)
-            fabric.print(f"step {iter_num}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
+            fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
             fabric.barrier()
         if not is_accumulating and step_count % save_interval == 0:
             checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
             save_checkpoint(fabric, model, checkpoint_path)
 
 
-@torch.no_grad()
-def validate(
-    fabric: L.Fabric, model: GPT, val_data: List[Dict], tokenizer: Tokenizer, longest_seq_length: int
-) -> torch.Tensor:
+@torch.inference_mode()
+def validate(fabric: L.Fabric, model: GPT, val_data: List[Dict], tokenizer: Tokenizer) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
     losses = torch.zeros(eval_iters)
     for k in range(eval_iters):
-        input_ids, targets = get_batch(fabric, val_data, longest_seq_length)
+        input_ids, targets = get_batch(fabric, val_data)
         logits = model(input_ids)
-        loss = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
-        losses[k] = loss.item()
+        losses[k] = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
     val_loss = losses.mean()
 
     # produce an example:
@@ -230,21 +222,20 @@ def validate(
     sample = {"instruction": instruction, "input": ""}
     prompt = generate_prompt(sample)
     encoded = tokenizer.encode(prompt, device=fabric.device)
-    max_returned_tokens = len(encoded) + 100
-    output = generate(
-        model, idx=encoded, max_returned_tokens=max_returned_tokens, max_seq_length=max_returned_tokens, temperature=0.8
-    )
+    with fabric.init_tensor():
+        # do not set `max_seq_length=max_returned_token` because memory is not a concern here
+        model.set_kv_cache(batch_size=1)
+    output = generate(model, encoded, max_returned_tokens=len(encoded) + eval_max_new_tokens, temperature=0.8)
+    model.clear_kv_cache()
     output = tokenizer.decode(output)
     fabric.print(output)
 
-    model.reset_cache()
-
     model.train()
-    return val_loss.item()
+    return val_loss
 
 
 def get_batch(
-    fabric: L.Fabric, data: List[Dict], longest_seq_length: int, longest_seq_ix: Optional[int] = None
+    fabric: L.Fabric, data: List[Dict], longest_seq_ix: Optional[int] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ix = torch.randint(len(data), (micro_batch_size,))
     if longest_seq_ix is not None:
@@ -254,8 +245,8 @@ def get_batch(
     input_ids = [data[i]["input_ids"].type(torch.int64) for i in ix]
     labels = [data[i]["labels"].type(torch.int64) for i in ix]
 
-    # it's better to pad to a fixed seq length with XLA to avoid recompilation
-    max_len = max(len(s) for s in input_ids) if fabric.device.type != "xla" else longest_seq_length
+    # this could be `longest_seq_length` to have a fixed size for all batches
+    max_len = max(len(s) for s in input_ids)
 
     def pad_right(x, pad_id):
         # pad right based on the longest sequence
@@ -272,17 +263,12 @@ def get_batch(
     return x, y
 
 
-def get_max_seq_length(data: List[Dict]) -> Tuple[int, int, int]:
+def get_longest_seq_length(data: List[Dict]) -> Tuple[int, int]:
     # find out the minimum max_seq_length required during fine-tuning (saves memory!)
     lengths = [len(d["input_ids"]) for d in data]
-    max_seq_length = max(lengths)
-    longest_seq_ix = lengths.index(max_seq_length)
-    # support easy override at the top of the file
-    return (
-        override_max_seq_length if isinstance(override_max_seq_length, int) else max_seq_length,
-        max_seq_length,
-        longest_seq_ix,
-    )
+    longest_seq_length = max(lengths)
+    longest_seq_ix = lengths.index(longest_seq_length)
+    return longest_seq_length, longest_seq_ix
 
 
 def save_checkpoint(fabric, model, file_path: Path):

@@ -1,7 +1,5 @@
-import json
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -16,7 +14,7 @@ sys.path.append(str(wd))
 from generate.base import generate
 from lit_gpt import GPT, Config, Tokenizer
 from lit_gpt.model import Block
-from lit_gpt.utils import check_valid_checkpoint_dir, get_default_supported_precision, lazy_load, quantization
+from lit_gpt.utils import check_valid_checkpoint_dir, get_default_supported_precision, load_checkpoint, quantization
 from scripts.prepare_alpaca import generate_prompt
 
 
@@ -65,8 +63,7 @@ def main(
 
     check_valid_checkpoint_dir(checkpoint_dir)
 
-    with open(checkpoint_dir / "lit_config.json") as fp:
-        config = Config(**json.load(fp))
+    config = Config.from_json(checkpoint_dir / "lit_config.json")
 
     if quantize is not None:
         # TODO: we need to clean-up the logic for quantizing the finetuned models and loading them after
@@ -80,33 +77,30 @@ def main(
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
     t0 = time.perf_counter()
-    with lazy_load(finetuned_path) as checkpoint:
-        model.load_state_dict(checkpoint.get("model", checkpoint), strict=quantize is None)
-    fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
     model.eval()
     model = fabric.setup(model)
 
+    load_checkpoint(fabric, model, checkpoint_path, strict=(quantize is None))
+    fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
+
     tokenizer = Tokenizer(checkpoint_dir)
     sample = {"instruction": prompt, "input": input}
     prompt = generate_prompt(sample)
-    encoded = tokenizer.encode(prompt, device=model.device)
+    encoded = tokenizer.encode(prompt, device=fabric.device)
     prompt_length = encoded.size(0)
     max_returned_tokens = prompt_length + max_new_tokens
 
+    with fabric.init_tensor():
+        # set the max_seq_length to limit the memory usage to what we need
+        model.max_seq_length = max_returned_tokens
+        # enable the kv cache
+        model.set_kv_cache(batch_size=1)
+
     t0 = time.perf_counter()
-    y = generate(
-        model,
-        encoded,
-        max_returned_tokens,
-        max_seq_length=max_returned_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        eos_id=tokenizer.eos_id,
-    )
+    y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, eos_id=tokenizer.eos_id)
     t = time.perf_counter() - t0
 
-    model.reset_cache()
     output = tokenizer.decode(y)
     output = output.split("### Response:")[1].strip()
     fabric.print(output)
@@ -121,9 +115,4 @@ if __name__ == "__main__":
     from jsonargparse import CLI
 
     torch.set_float32_matmul_precision("high")
-    warnings.filterwarnings(
-        # Triggered internally at ../aten/src/ATen/EmptyTensor.cpp:31
-        "ignore",
-        message="ComplexHalf support is experimental and many operators don't support it yet",
-    )
     CLI(main)
