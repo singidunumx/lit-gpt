@@ -20,21 +20,11 @@ class Tokenizer:
 
             self.processor = HFTokenizer.from_file(str(vocabulary_path))
             self.backend = "huggingface"
-
-            if (special_tokens_path := checkpoint_dir / "generation_config.json").is_file():
-                with open(special_tokens_path) as fp:
-                    config = json.load(fp)
-                self.bos_id = config.get("bos_token_id")
-                self.eos_id = config.get("eos_token_id")
-
-            elif (special_tokens_path := checkpoint_dir / "tokenizer_config.json").is_file():
-                with open(special_tokens_path) as fp:
-                    config = json.load(fp)
-                bos_token = config.get("bos_token")
-                self.bos_id = self.token_to_id(bos_token) if bos_token is not None else None
-                self.eos_id = self.token_to_id(config["eos_token"])
-            else:
-                raise RuntimeError("Missing tokenizer config")
+            with open(checkpoint_dir / "tokenizer_config.json") as fp:
+                config = json.load(fp)
+            bos_token = config.get("bos_token")
+            self.bos_id = self.token_to_id(bos_token) if bos_token is not None else None
+            self.eos_id = self.token_to_id(config["eos_token"])
         else:
             raise NotImplementedError
 
@@ -62,7 +52,7 @@ class Tokenizer:
         string: str,
         device: Optional[torch.device] = None,
         bos: bool = False,
-        eos: bool = False,
+        eos: bool = True,
         max_length: int = -1,
     ) -> torch.Tensor:
         if self.backend == "huggingface":

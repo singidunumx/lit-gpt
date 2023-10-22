@@ -48,8 +48,7 @@ class Config:
     norm_eps: float = 1e-5
     _mlp_class: Literal["GptNeoxMLP", "LLaMAMLP"] = "GptNeoxMLP"
     intermediate_size: Optional[int] = None
-    rope_condense_ratio: int = 1
-    rope_base: int = 10000
+    condense_ratio: int = 1
 
     def __post_init__(self):
         # error checking
@@ -57,9 +56,6 @@ class Config:
         # vocab size should be a power of 2 to be optimal on hardware. compute the closest value
         if self.padded_vocab_size is None:
             self.padded_vocab_size = find_multiple(self.vocab_size, self.padding_multiple)
-        else:
-            # vocab size shouldn't be larger than padded vocab size
-            self.vocab_size = min(self.vocab_size, self.padded_vocab_size)
         # compute the number of query groups
         if self.n_query_groups is not None:
             assert self.n_head % self.n_query_groups == 0
@@ -78,8 +74,6 @@ class Config:
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
         conf_dict = name_to_config[name].copy()
-        if "condense_ratio" in kwargs:  # legacy name
-            kwargs["rope_condense_ratio"] = kwargs.pop("condense_ratio")
         conf_dict.update(kwargs)
         return cls(**conf_dict)
 
@@ -95,6 +89,9 @@ class Config:
             from lit_gpt.rmsnorm import RMSNorm
 
             return RMSNorm
+        elif self._norm_class == "FusedRMSNorm":
+            from lit_gpt.rmsnorm import FusedRMSNorm
+            return FusedRMSNorm
         return getattr(torch.nn, self._norm_class)
 
 
@@ -103,11 +100,11 @@ class Config:
 ########################
 configs = [
     # https://huggingface.co/stabilityai/stablelm-base-alpha-3b/blob/main/config.json
-    dict(org="stabilityai", name="stablelm-base-alpha-3b"),
+    dict(org="stabilityai", name="stablelm-base-alpha-3b", padding_multiple=512),
     # https://huggingface.co/stabilityai/stablelm-base-alpha-7b/blob/main/config.json
     dict(org="stabilityai", name="stablelm-base-alpha-7b", n_head=48, n_embd=6144, padding_multiple=256),
     # https://huggingface.co/stabilityai/stablelm-tuned-alpha-3b/blob/main/config.json
-    dict(org="stabilityai", name="stablelm-tuned-alpha-3b", n_head=32),
+    dict(org="stabilityai", name="stablelm-tuned-alpha-3b", n_head=32, padding_multiple=512),
     # https://huggingface.co/stabilityai/stablelm-tuned-alpha-7b/blob/main/config.json
     dict(org="stabilityai", name="stablelm-tuned-alpha-7b", n_head=48, n_embd=6144, padding_multiple=256),
 ]
@@ -127,17 +124,23 @@ pythia = [
         org="EleutherAI", name="pythia-410m", block_size=2048, n_layer=24, n_embd=1024, n_head=16, padding_multiple=128
     ),
     # https://huggingface.co/EleutherAI/pythia-1b/blob/main/config.json
-    dict(org="EleutherAI", name="pythia-1b", block_size=2048, n_embd=2048, n_head=8, padding_multiple=128),
+    dict(org="EleutherAI", name="pythia-1b", block_size=2048, n_layer=16, n_embd=2048, n_head=8, padding_multiple=128),
     # https://huggingface.co/EleutherAI/pythia-1.4b/blob/main/config.json
     dict(
         org="EleutherAI", name="pythia-1.4b", block_size=2048, n_layer=24, n_embd=2048, n_head=16, padding_multiple=128
     ),
     # https://huggingface.co/EleutherAI/pythia-2.8b/blob/main/config.json
-    dict(org="EleutherAI", name="pythia-2.8b", block_size=2048, n_layer=32, n_embd=2560, padding_multiple=128),
+    dict(
+        org="EleutherAI", name="pythia-2.8b", block_size=2048, n_layer=32, n_embd=2560, n_head=32, padding_multiple=128
+    ),
     # https://huggingface.co/EleutherAI/pythia-6.9b/blob/main/config.json
-    dict(org="EleutherAI", name="pythia-6.9b", block_size=2048, n_layer=32, padding_multiple=256),
+    dict(
+        org="EleutherAI", name="pythia-6.9b", block_size=2048, n_layer=32, n_embd=4096, n_head=32, padding_multiple=256
+    ),
     # https://huggingface.co/EleutherAI/pythia-12b/blob/main/config.json
-    dict(org="EleutherAI", name="pythia-12b", block_size=2048, n_layer=36, n_embd=5120, n_head=40),
+    dict(
+        org="EleutherAI", name="pythia-12b", block_size=2048, n_layer=36, n_embd=5120, n_head=40, padding_multiple=512
+    ),
 ]
 configs.extend(pythia)
 for c in pythia:
@@ -157,6 +160,7 @@ redpajama_incite = [
         block_size=2048,
         n_layer=32,
         n_embd=2560,
+        n_head=32,
         padding_multiple=256,
         rotary_percentage=1.0,
         parallel_residual=False,
@@ -167,6 +171,8 @@ redpajama_incite = [
         name="RedPajama-INCITE-7B-{}",
         block_size=2048,
         n_layer=32,
+        n_embd=4096,
+        n_head=32,
         padding_multiple=256,
         rotary_percentage=1.0,
         parallel_residual=False,
@@ -177,6 +183,8 @@ redpajama_incite = [
         name="RedPajama-INCITE-{}-7B-v0.1",
         block_size=2048,
         n_layer=32,
+        n_embd=4096,
+        n_head=32,
         padding_multiple=256,
         rotary_percentage=1.0,
         parallel_residual=False,
@@ -203,6 +211,7 @@ falcon = [
         n_head=71,
         n_embd=4544,
         rotary_percentage=1.0,
+        parallel_residual=True,
         n_query_groups=1,
         bias=False,
         # this is not in the config, but in the original model implementation, only for this config
@@ -218,6 +227,7 @@ falcon = [
         n_head=128,
         n_embd=8192,
         rotary_percentage=1.0,
+        parallel_residual=True,
         n_query_groups=8,
         bias=False,
     ),
@@ -227,6 +237,71 @@ for c in falcon:
         copy = c.copy()
         copy["name"] = c["name"].format(kind)
         configs.append(copy)
+
+
+#############################
+# StatNLP Research
+#############################
+tiny_LLaMA = [
+     
+    # https://twitter.com/cwolferesearch/status/1691929174175264858
+    dict(
+        org="StatNLP-research",
+        name="tiny_LLaMA_1b",
+        block_size=2048,
+        vocab_size=32000,
+        padding_multiple=64,
+        n_layer=22,
+        n_head=32,
+        n_embd=2048,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        _norm_class="FusedRMSNorm",
+        norm_eps=1e-5, #Llama 2 use 1e-5. Llama 1 use 1e-6
+        _mlp_class="LLaMAMLP",
+        intermediate_size=5632,
+        n_query_groups=4,
+    ),
+    dict(
+        org="StatNLP-research",
+        name="tiny_LLaMA_120M",
+        block_size=2048,
+        vocab_size=32000,
+        padding_multiple=64,
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        _norm_class="FusedRMSNorm",
+        norm_eps=1e-5,
+        _mlp_class="LLaMAMLP",
+        intermediate_size=2048,
+        n_query_groups=1,
+    ),
+    dict(
+        org="StatNLP-research",
+        name="code_tiny_LLaMA_1b",
+        block_size=8192,
+        vocab_size=32000,
+        padding_multiple=64,
+        n_layer=22,
+        n_head=32,
+        n_embd=2048,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        _norm_class="FusedRMSNorm",
+        norm_eps=1e-5, #Llama 2 use 1e-5. Llama 1 use 1e-6
+        _mlp_class="LLaMAMLP",
+        intermediate_size=5632,
+        n_query_groups=4,
+        condense_ratio= 4
+    ),
+]
+configs.extend(tiny_LLaMA)
 
 
 #############################
@@ -241,6 +316,7 @@ open_LLaMA = [
         vocab_size=32000,
         padding_multiple=64,
         n_layer=26,
+        n_head=32,
         n_embd=3200,
         rotary_percentage=1.0,
         parallel_residual=False,
@@ -258,6 +334,8 @@ open_LLaMA = [
         vocab_size=32000,
         padding_multiple=64,
         n_layer=32,
+        n_head=32,
+        n_embd=4096,
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
@@ -300,6 +378,8 @@ vicuna = [
         vocab_size=32000,
         padding_multiple=64,
         n_layer=32,
+        n_head=32,
+        n_embd=4096,
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
@@ -344,21 +424,23 @@ vicuna = [
         _mlp_class="LLaMAMLP",
         intermediate_size=17920,
     ),
-    # https://huggingface.co/lmsys/vicuna-7b-v1.5/blob/main/config.json
     dict(
         org="lmsys",
         name="vicuna-7b-v1.5",
+        block_size=4096,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=32,
+        n_head=32,
+        n_embd=4096,
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=11008,
     ),
-    # https://huggingface.co/lmsys/vicuna-7b-v1.5-16k/blob/main/config.json
     dict(
         org="lmsys",
         name="vicuna-7b-v1.5-16k",
@@ -366,18 +448,21 @@ vicuna = [
         vocab_size=32000,
         padding_multiple=64,
         n_layer=32,
+        n_head=32,
+        n_embd=4096,
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=11008,
-        rope_condense_ratio=4,
+        condense_ratio=4,
     ),
-    # https://huggingface.co/lmsys/vicuna-13b-v1.5/blob/main/config.json
     dict(
         org="lmsys",
         name="vicuna-13b-v1.5",
+        block_size=4096,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=40,
@@ -387,10 +472,10 @@ vicuna = [
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=13824,
     ),
-    # https://huggingface.co/lmsys/vicuna-13b-v1.5-16k/blob/main/config.json
     dict(
         org="lmsys",
         name="vicuna-13b-v1.5-16k",
@@ -404,9 +489,10 @@ vicuna = [
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=13824,
-        rope_condense_ratio=4,
+        condense_ratio=4,
     ),
 ]
 configs.extend(vicuna)
@@ -424,6 +510,8 @@ long_chat = [
         vocab_size=32000,
         padding_multiple=64,
         n_layer=32,
+        n_head=32,
+        n_embd=4096,
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
@@ -431,7 +519,7 @@ long_chat = [
         norm_eps=1e-6,
         _mlp_class="LLaMAMLP",
         intermediate_size=11008,
-        rope_condense_ratio=8,
+        condense_ratio=8,
     ),
     # https://huggingface.co/lmsys/longchat-13b-16k/blob/main/config.json
     dict(
@@ -460,20 +548,6 @@ configs.extend(long_chat)
 # NousResearch Hermes
 ######################
 nous_research = [
-    # https://huggingface.co/NousResearch/Nous-Hermes-llama-2-7b/blob/main/config.json
-    dict(
-        org="NousResearch",
-        name="Nous-Hermes-llama-2-7b",
-        padded_vocab_size=32000,
-        n_layer=32,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=11008,
-    ),
     # https://huggingface.co/NousResearch/Nous-Hermes-13B/blob/main/config.json
     dict(
         org="NousResearch",
@@ -490,23 +564,7 @@ nous_research = [
         norm_eps=1e-6,
         _mlp_class="LLaMAMLP",
         intermediate_size=13824,
-    ),
-    # https://huggingface.co/NousResearch/Nous-Hermes-Llama2-13b
-    dict(
-        org="NousResearch",
-        name="Nous-Hermes-Llama2-13b",
-        padded_vocab_size=32032,
-        n_layer=40,
-        n_head=40,
-        n_embd=5120,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=13824,
-    ),
+    )
 ]
 configs.extend(nous_research)
 
@@ -519,13 +577,35 @@ llama_2 = [
     dict(
         org="meta-llama",
         name="Llama-2-7b{}-hf",
+        block_size=4096,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=32,
+        n_head=32,
+        n_embd=4096,
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
+        _mlp_class="LLaMAMLP",
+        intermediate_size=11008,
+    ),
+    dict(
+        org="meta-llama",
+        name="CodeLlama-2-7b-hf",
+        block_size=4096,
+        vocab_size=32016,
+        padded_vocab_size=32016,
+        padding_multiple=64,
+        n_layer=32,
+        n_head=32,
+        n_embd=4096,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=11008,
     ),
@@ -533,6 +613,7 @@ llama_2 = [
     dict(
         org="meta-llama",
         name="Llama-2-13b{}-hf",
+        block_size=4096,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=40,
@@ -542,6 +623,7 @@ llama_2 = [
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=13824,
     ),
@@ -549,6 +631,7 @@ llama_2 = [
     dict(
         org="meta-llama",
         name="Llama-2-70b{}-hf",
+        block_size=4096,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=80,
@@ -559,6 +642,7 @@ llama_2 = [
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=28672,
     ),
@@ -578,6 +662,7 @@ freewilly_2 = [
     dict(
         org="stabilityai",
         name="FreeWilly2",
+        block_size=4096,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=80,
@@ -588,340 +673,12 @@ freewilly_2 = [
         parallel_residual=False,
         bias=False,
         _norm_class="RMSNorm",
+        norm_eps=1e-5,
         _mlp_class="LLaMAMLP",
         intermediate_size=28672,
     )
 ]
 configs.extend(freewilly_2)
-
-
-##################
-# Meta Code Llama
-##################
-code_llama = [
-    # https://huggingface.co/codellama/CodeLlama-7b-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-7b-hf",
-        block_size=16384,
-        vocab_size=32016,
-        padding_multiple=16,
-        n_layer=32,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=11008,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-13b-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-13b-hf",
-        block_size=16384,
-        vocab_size=32016,
-        padding_multiple=16,
-        n_layer=40,
-        n_head=40,
-        n_embd=5120,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=13824,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-34b-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-34b-hf",
-        block_size=16384,
-        vocab_size=32000,
-        padding_multiple=64,
-        n_layer=48,
-        n_head=64,
-        n_embd=8192,
-        n_query_groups=8,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=22016,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-7b-Python-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-7b-Python-hf",
-        block_size=16384,
-        vocab_size=32000,
-        padding_multiple=64,
-        n_layer=32,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=11008,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-13b-Python-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-13b-Python-hf",
-        block_size=16384,
-        vocab_size=32000,
-        padding_multiple=64,
-        n_layer=40,
-        n_head=40,
-        n_embd=5120,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=13824,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-34b-Python-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-34b-Python-hf",
-        block_size=16384,
-        vocab_size=32000,
-        padding_multiple=64,
-        n_layer=48,
-        n_head=64,
-        n_embd=8192,
-        n_query_groups=8,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=22016,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-7b-Instruct-hf/tree/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-7b-Instruct-hf",
-        block_size=16384,
-        vocab_size=32016,
-        padding_multiple=16,
-        n_layer=32,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=11008,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-13b-Instruct-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-13b-Instruct-hf",
-        block_size=2048,
-        vocab_size=32016,
-        padding_multiple=16,
-        n_layer=40,
-        n_head=40,
-        n_embd=5120,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=13824,
-        rope_base=1000000,
-    ),
-    # https://huggingface.co/codellama/CodeLlama-34b-Instruct-hf/blob/main/config.json
-    dict(
-        org="codellama",
-        name="CodeLlama-34b-Instruct-hf",
-        block_size=16384,
-        vocab_size=32000,
-        padding_multiple=64,
-        n_layer=48,
-        n_head=64,
-        n_embd=8192,
-        n_query_groups=8,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=22016,
-        rope_base=1000000,
-    ),
-]
-configs.extend(code_llama)
-
-
-########################
-# garage-bAInd Platypus
-########################
-platypus = [
-    # https://huggingface.co/garage-bAInd/Platypus-30B/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Platypus-30B",
-        block_size=2048,
-        padded_vocab_size=32000,
-        n_layer=60,
-        n_head=52,
-        n_embd=6656,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-06,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=17920,
-    ),
-    # https://huggingface.co/garage-bAInd/Platypus2-7B/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Platypus2-7B",
-        padded_vocab_size=32000,
-        n_layer=32,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=11008,
-    ),
-    # https://huggingface.co/garage-bAInd/Platypus2-13B/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Platypus2-13B",
-        padded_vocab_size=32000,
-        n_layer=40,
-        n_head=40,
-        n_embd=5120,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        norm_eps=1e-05,
-        _mlp_class="LLaMAMLP",
-        intermediate_size=13824,
-    ),
-    # https://huggingface.co/garage-bAInd/Platypus2-70B/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Platypus2-70B",
-        padded_vocab_size=32000,
-        n_layer=80,
-        n_head=64,
-        n_embd=8192,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        _mlp_class="LLaMAMLP",
-        intermediate_size=28672,
-    ),
-    # https://huggingface.co/garage-bAInd/Camel-Platypus2-13B/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Camel-Platypus2-13B",
-        padded_vocab_size=32000,
-        n_layer=40,
-        n_head=40,
-        n_embd=5120,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        _mlp_class="LLaMAMLP",
-        intermediate_size=13824,
-    ),
-    # https://huggingface.co/garage-bAInd/Camel-Platypus2-70B/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Camel-Platypus2-70B",
-        padded_vocab_size=32000,
-        n_layer=80,
-        n_head=64,
-        n_embd=8192,
-        n_query_groups=8,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        _mlp_class="LLaMAMLP",
-        intermediate_size=28672,
-    ),
-    # https://huggingface.co/garage-bAInd/Stable-Platypus2-13B/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Stable-Platypus2-13B",
-        padded_vocab_size=32000,
-        n_layer=40,
-        n_head=40,
-        n_embd=5120,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        _mlp_class="LLaMAMLP",
-        intermediate_size=13824,
-    ),
-    # https://huggingface.co/garage-bAInd/Platypus2-70B-instruct/blob/main/config.json
-    dict(
-        org="garage-bAInd",
-        name="Platypus2-70B-instruct",
-        padded_vocab_size=32000,
-        n_layer=80,
-        n_head=64,
-        n_embd=8192,
-        n_query_groups=8,
-        rotary_percentage=1.0,
-        parallel_residual=False,
-        bias=False,
-        _norm_class="RMSNorm",
-        _mlp_class="LLaMAMLP",
-        intermediate_size=28672,
-    ),
-]
-configs.extend(platypus)
-
-
-##########################
-# Stability AI StableCode
-##########################
-stablecode = [
-    # https://huggingface.co/stabilityai/stablecode-completion-alpha-3b/blob/main/config.json
-    dict(
-        org="stabilityai",
-        name="stablecode-completion-alpha-3b",
-        block_size=16384,
-        vocab_size=49152,
-        n_layer=32,
-        n_embd=2560,
-    ),
-    # https://huggingface.co/stabilityai/stablecode-completion-alpha-3b-4k/blob/main/config.json
-    dict(org="stabilityai", name="stablecode-completion-alpha-3b-4k", vocab_size=49152, n_layer=32, n_embd=2560),
-    # https://huggingface.co/stabilityai/stablecode-instruct-alpha-3b/blob/main/config.json
-    dict(org="stabilityai", name="stablecode-instruct-alpha-3b", vocab_size=49152, n_layer=32, n_embd=2560),
-]
-configs.extend(stablecode)
 
 
 name_to_config = {config["name"]: config for config in configs}

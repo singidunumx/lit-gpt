@@ -5,11 +5,10 @@ from typing import Any, Callable, Deque, Dict, Optional
 
 import torch
 from lightning import Callback, Fabric, LightningModule, Trainer
-from lightning.fabric.accelerators.xla import _XLA_GREATER_EQUAL_2_1
 from lightning.fabric.utilities.rank_zero import rank_zero_only as fabric_rank_zero_only
 from lightning.pytorch.utilities.rank_zero import rank_zero_only as trainer_rank_zero_only
 from torch.utils.flop_counter import FlopCounterMode
-
+import math
 from lit_gpt import GPT, Config
 from lit_gpt.utils import num_parameters
 
@@ -69,8 +68,6 @@ TPU_AVAILABLE_FLOPS = {
     "v3": 123e12,
     # source: https://cloud.google.com/tpu/docs/system-architecture-tpu-vm#tpu_v4
     "v4": 275e12,
-    # source: https://cloud.google.com/tpu/docs/v5e-training
-    "v5litepod": 197e12,
 }
 
 
@@ -98,8 +95,6 @@ def get_flops_available(device: torch.device, precision: str) -> Optional[float]
 
         if device_name is not None:
             try:
-                if precision == "transformer-engine":
-                    precision = "8-mixed"
                 return int(GPU_AVAILABLE_FLOPS[device_name][precision])
             except KeyError:
                 raise KeyError(
@@ -107,10 +102,7 @@ def get_flops_available(device: torch.device, precision: str) -> Optional[float]
                     "MFU cannot be calculated and reported."
                 )
     elif device.type == "xla":
-        if _XLA_GREATER_EQUAL_2_1:
-            from torch_xla._internal import tpu
-        else:
-            from torch_xla.experimental import tpu
+        from torch_xla.experimental import tpu
 
         device_name = tpu.get_tpu_env()["TYPE"].lower()
         try:
@@ -194,12 +186,14 @@ class SpeedMonitorBase:
         log_dict: Callable[[Dict, int], None],
         window_size: int = 100,
         time_unit: str = "hours",
+        log_iter_interval: int = 1,
     ):
         self.flops_available = flops_available
         self.log_dict = log_dict
-
+        self.log_iter_interval = log_iter_interval
         # Track the batch num samples and wct to compute throughput over a window of batches
         self.history_samples: Deque[int] = deque(maxlen=window_size + 1)
+        self.history_training_loss: Deque[int] = deque(maxlen=log_iter_interval)
         self.history_wct: Deque[float] = deque(maxlen=window_size + 1)
         self.history_lengths: Deque[int] = deque(maxlen=window_size + 1)
         self.history_flops: Deque[int] = deque(maxlen=window_size + 1)
@@ -220,7 +214,7 @@ class SpeedMonitorBase:
 
         # Keep track of time spent evaluating
         self.total_eval_wct = 0.0
-        self.step = -1
+        self.iter = -1
 
     def on_train_batch_end(
         self,
@@ -229,12 +223,13 @@ class SpeedMonitorBase:
         world_size: int,
         flops_per_batch: Optional[int] = None,  # (per device)
         lengths: Optional[int] = None,  # total length of the samples seen (per device)
+        train_loss: Optional[float] = None,
     ):
-        self.step += 1
-        step = self.step
+        self.iter += 1
         metrics = {}
 
         self.history_samples.append(samples)
+        self.history_training_loss.append(train_loss)
         if lengths is not None:
             self.history_lengths.append(lengths)
             # if lengths are passed, there should be as many values as samples
@@ -256,13 +251,22 @@ class SpeedMonitorBase:
             )
             if lengths is not None:
                 elapsed_lengths = int(self.history_lengths[-1]) - int(self.history_lengths[0])
-                avg_length = elapsed_lengths / elapsed_batches
+                avg_length = elapsed_lengths / elapsed_batches  
                 metrics.update(
                     {
                         "throughput/tokens_per_sec": samples_per_sec * avg_length,
                         "throughput/device/tokens_per_sec": dev_samples_per_sec * avg_length,
+                        "total_tokens": avg_length * world_size * samples,
                     }
                 )
+                if train_loss is not None:
+                    avg_loss = sum(self.history_training_loss) / len(self.history_training_loss)
+                    metrics.update(
+                        {
+                            "metric/train_loss": avg_loss,
+                            "metric/train_ppl": math.exp(avg_loss)
+                        }
+                    )
 
         if flops_per_batch is not None:
             # sum of flops per batch across ranks
@@ -286,8 +290,8 @@ class SpeedMonitorBase:
                 "samples": samples,
             }
         )
-
-        self.log_dict(metrics, step)
+        if self.iter % self.log_iter_interval == 0:
+            self.log_dict(metrics, self.iter//self.log_iter_interval)
 
     def eval_end(self, eval_elapsed: float):
         self.total_eval_wct += eval_elapsed  # seconds

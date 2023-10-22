@@ -10,12 +10,12 @@ import torch
 import torch.nn as nn
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
-
+from flash_attn import flash_attn_func
 from lit_gpt.config import Config
-
+from xformers.ops import SwiGLU
+from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
 
@@ -37,14 +37,24 @@ class GPT(nn.Module):
         self.mask_cache: Optional[torch.Tensor] = None
         self.kv_caches: List[KVCache] = []
 
-    def _init_weights(self, module: nn.Module) -> None:
+    def _init_weights(self, module: nn.Module, n_layer) -> None:
         """Meant to be used with `gpt.apply(gpt._init_weights)`."""
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # GPT-NeoX  https://arxiv.org/pdf/2204.06745.pdf
+        # print module name
+        if isinstance(module, nn.Embedding):
+            # RWKV: set it to 1e-4
+            torch.nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / module.weight.size(1)))
+            # torch.nn.init.normal_(module.weight,  -1e-4, 1e-4)
+        elif isinstance(module, nn.Linear):
+            # fan-in variance scaling intializer
+            torch.nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / module.weight.size(1)))
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # GPT-NeoX       
+        for name, p in module.named_parameters():
+            if (name == "proj.weight" and isinstance(module, LLaMAMLP)) or (name == "w3.weight" and isinstance(module, SwiGLU)):  #if use xformer swiglu, fc2 layer will be renamed to w3
+                nn.init.normal_(p, mean=0.0, std=1 / math.sqrt(p.shape[-1])  /  n_layer)
+        
 
     def reset_cache(self) -> None:
         self.kv_caches.clear()
@@ -79,6 +89,7 @@ class GPT(nn.Module):
 
         cos, sin = self.rope_cache
         if use_kv_cache:
+
             cos = cos.index_select(0, input_pos)
             sin = sin.index_select(0, input_pos)
             mask = self.mask_cache.index_select(2, input_pos)
@@ -90,12 +101,12 @@ class GPT(nn.Module):
 
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-
+            
         if not use_kv_cache:
             for block in self.transformer.h:
                 x, *_ = block(x, (cos, sin), max_seq_length)
         else:
-            self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1))
+            self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1) * 2)
             for i, block in enumerate(self.transformer.h):
                 x, self.kv_caches[i] = block(x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
 
@@ -111,10 +122,9 @@ class GPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            dtype=torch.get_default_dtype(),
+            dtype=torch.bfloat16,
             device=idx.device,
-            condense_ratio=self.config.rope_condense_ratio,
-            base=self.config.rope_base,
+            condense_ratio=self.config.condense_ratio,
         )
 
     def build_mask_cache(self, idx: torch.Tensor) -> torch.Tensor:
@@ -123,14 +133,15 @@ class GPT(nn.Module):
 
     def build_kv_caches(self, idx: torch.Tensor, max_seq_length: int, rope_cache_length: int) -> List[KVCache]:
         B = idx.size(0)
-        heads = 1 if self.config.n_query_groups == 1 else self.config.n_head
+        heads = 1 if self.config.n_query_groups == 1 else self.config.n_query_groups
+
         k_cache_shape = (
             B,
-            heads,
             max_seq_length,
+            heads,
             rope_cache_length + self.config.head_size - int(self.config.rotary_percentage * self.config.head_size),
         )
-        v_cache_shape = (B, heads, max_seq_length, self.config.head_size)
+        v_cache_shape = (B, max_seq_length, heads, self.config.head_size)
         device = idx.device
         return [
             (torch.zeros(k_cache_shape, device=device), torch.zeros(v_cache_shape, device=device))
@@ -146,9 +157,7 @@ class Block(nn.Module):
         if not config.shared_attention_norm:
             self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
         self.mlp = config.mlp_class(config)
-
         self.config = config
-
     def forward(
         self,
         x: torch.Tensor,
@@ -158,6 +167,7 @@ class Block(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+
         n_1 = self.norm_1(x)
         h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
         if self.config.parallel_residual:
@@ -169,6 +179,7 @@ class Block(nn.Module):
                     "No checkpoint amongst the ones we support uses this configuration"
                     " (non-parallel residual and shared attention norm)."
                 )
+            
             x = x + h
             x = x + self.mlp(self.norm_2(x))
         return x, new_kv_cache
@@ -201,29 +212,37 @@ class CausalSelfAttention(nn.Module):
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
         total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
-        qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size)
-        qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
+        qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size) # (B, T, n_query_groups, total_qkv, hs)
+        # qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
 
         # split batched computation into three
-        q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
+        q, k, v = qkv.split((q_per_kv, 1, 1), dim=-2)
 
         # repeat k and v if necessary
-        if self.config.n_query_groups != 1:  # doing this would require a full kv cache with MQA (inefficient!)
-            # for MHA this is a no-op
-            k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
-            v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+        # Peiyuan: we do not need to do this as flash attention 2 already support GQA
+        # if self.config.n_query_groups != 1:  # doing this would require a full kv cache with MQA (inefficient!)
+        #     # for MHA this is a no-op
+        #     k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+        #     v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
 
-        q = q.reshape(B, -1, T, self.config.head_size)  # (B, nh_q, T, hs)
-        k = k.reshape(B, -1, T, self.config.head_size)  # (B, nh_k, T, hs)
-        v = v.reshape(B, -1, T, self.config.head_size)  # (B, nh_v, T, hs)
-
-        n_elem = int(self.config.rotary_percentage * self.config.head_size)
+        q = q.reshape(B,  T, -1, self.config.head_size)  # (B, T, nh_q, hs)
+        k = k.reshape(B,  T, -1, self.config.head_size)  
+        v = v.reshape(B,  T, -1, self.config.head_size)  
 
         cos, sin = rope
-        q_roped = apply_rope(q[..., :n_elem], cos, sin)
-        k_roped = apply_rope(k[..., :n_elem], cos, sin)
-        q = torch.cat((q_roped, q[..., n_elem:]), dim=-1)
-        k = torch.cat((k_roped, k[..., n_elem:]), dim=-1)
+
+        # apply rope in fp32 significanly stabalize training
+        # fused rope expect (batch_size, seqlen, nheads, headdim)
+        q = apply_rotary_emb_func(q, cos, sin, False, True)
+        k = apply_rotary_emb_func(k, cos, sin, False, True)
+        
+        # n_elem = int(self.config.rotary_percentage * self.config.head_size)
+    
+        # q_roped = apply_rope(q[..., :n_elem], cos.repeat(1,2), sin.repeat(1,2))
+        # k_roped = apply_rope(k[..., :n_elem], cos.repeat(1,2), sin.repeat(1,2))
+        # print( (q_roped - q).sum())
+        # q = torch.cat((q_roped, q[..., n_elem:]), dim=-1)
+        # k = torch.cat((k_roped, k[..., n_elem:]), dim=-1)
 
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
@@ -232,10 +251,11 @@ class CausalSelfAttention(nn.Module):
             if input_pos[-1] >= max_seq_length:
                 input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
                 # shift 1 position to the left
-                cache_k = torch.roll(cache_k, -1, dims=2)
-                cache_v = torch.roll(cache_v, -1, dims=2)
-            k = cache_k.index_copy_(2, input_pos, k)
-            v = cache_v.index_copy_(2, input_pos, v)
+                cache_k = torch.roll(cache_k, -1, dims=1)
+                cache_v = torch.roll(cache_v, -1, dims=1)
+
+            k = cache_k.index_copy_(1, input_pos, k)
+            v = cache_v.index_copy_(1, input_pos, v)
             kv_cache = k, v
 
         y = self.scaled_dot_product_attention(q, k, v, mask=mask)
@@ -251,6 +271,7 @@ class CausalSelfAttention(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
     ):
         scale = 1.0 / math.sqrt(self.config.head_size)
+        
         if (
             FlashAttention2Available
             and mask is None
@@ -259,11 +280,13 @@ class CausalSelfAttention(nn.Module):
         ):
             from flash_attn import flash_attn_func
 
-            # flash-attn requires (B, T, nh, hs)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
             return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if q.size() != k.size():
+             k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
+             v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
         )
@@ -285,15 +308,16 @@ class GptNeoxMLP(nn.Module):
 class LLaMAMLP(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-
+        # self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        # self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        # self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_fc_1 = self.fc_1(x)
-        x_fc_2 = self.fc_2(x)
-        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
-        return self.proj(x)
+        # x_fc_1 = self.fc_1(x)
+        # x_fc_2 = self.fc_2(x)
+        # x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        # return self.proj(x)
+        return self.swiglu(x)
 
 
 def build_rope_cache(
@@ -312,10 +336,13 @@ def build_rope_cache(
     seq_idx = torch.arange(seq_len, device=device) / condense_ratio
 
     # Calculate the product of position index and $\theta_i$
-    idx_theta = torch.outer(seq_idx, theta).repeat(1, 2)
+    idx_theta = torch.outer(seq_idx, theta)
 
     cos, sin = torch.cos(idx_theta), torch.sin(idx_theta)
 
+    # added by peiyuan to ensure same data type with q, k, to use fused rotary embedding
+    if dtype == torch.bfloat16:
+        return cos.bfloat16(), sin.bfloat16()
     # this is to mimic the behaviour of complex32, else we will get different results
     if dtype in (torch.float16, torch.bfloat16, torch.int8):
         return cos.half(), sin.half()
