@@ -21,15 +21,22 @@ class SlimPajamaDataRecipe(DataChunkRecipe):
 
     def prepare_structure(self, input_dir):
         files = Path(input_dir).rglob("*.zst")
-        return [str(file) for file in files]
+        return sorted([str(file) for file in files])[0:4]
 
     def prepare_item(self, filepath):
+        print("Processing", filepath)
+        i = 0
         with zstd.open(open(filepath, "rb"), "rt", encoding="utf-8") as f:
             for row in f:
                 text = json.loads(row)["text"]
                 if json.loads(row)["meta"]["redpajama_set_name"] == "RedPajamaGithub":
                     continue  # exclude the GitHub data since it overlaps with starcoder
-                text_ids = self.tokenizer.encode(text, bos=False, eos=True)
+                import torch
+                text_ids = self.tokenizer.encode(text, bos=False, eos=True)# .to(torch.long)
+                print(text_ids[0:10])
+                # i += 1
+                # if i > 4:
+                #     assert False
                 yield text_ids
 
 
@@ -46,8 +53,9 @@ def prepare(
         input_dir=str(input_dir),
         output_dir=str(output_dir),
         fast_dev_run=fast_dev_run,
-        num_workers=os.cpu_count(),
+        num_workers=4, # os.cpu_count(),
         num_downloaders=1,
+        reorder_files=False,
     )
 
     start_time = time.time()

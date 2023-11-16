@@ -46,6 +46,7 @@ class PackedDataset(IterableDataset):
 
         max_num_files = len(self._filenames) // num_shards * num_shards
         filenames = self._filenames[shard_id:max_num_files:num_shards]
+        # filenames = self._filenames
 
         return PackedDatasetIterator(
             filenames=filenames,
@@ -173,6 +174,7 @@ class PackedDatasetIterator:
             self._file_idx = 0
 
         for i in range(self._n_chunks):
+            print("Loading chunk", self._file_idx + i)
             filename = self._filenames[self._file_idx + i]
             if self._dtype is None:
                 self._dtype, self._chunk_size = self._read_header(filename)
@@ -207,6 +209,9 @@ class PackedDatasetIterator:
         elem_id = (block_idx % self._n_blocks) * self._block_size
         offset = np.dtype(self._dtype).itemsize * elem_id
         arr = np.frombuffer(buffer, dtype=self._dtype, count=self._block_size, offset=offset)
+        print(f"{self._dtype=}, {chunk_id=}, {block_idx=}, {elem_id=}, {offset=}, {self._curr_idx=}")
+        # print(arr.astype(np.int64))
+
         self._curr_idx += 1
         return torch.from_numpy(arr.astype(np.int64))
 

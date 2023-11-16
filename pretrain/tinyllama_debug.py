@@ -8,15 +8,15 @@ import time
 from functools import partial
 from pathlib import Path
 from typing import Tuple, Union
-import glob
-import random
 
 import lightning as L
 import torch
 import torch.nn as nn
-from lightning.fabric.loggers import CSVLogger
+from lightning.data import StreamingDataset
+from lightning.data.streaming.item_loader import TokensLoader
 from lightning.fabric.strategies import FSDPStrategy
-from lightning.fabric.utilities.throughput import ThroughputMonitor, measure_flops
+from lightning.fabric.utilities.throughput import Throughput, get_available_flops, measure_flops
+from lightning.fabric.loggers import CSVLogger
 from lightning.pytorch.loggers import WandbLogger
 from torch.utils.data import DataLoader
 
@@ -30,21 +30,21 @@ from lit_gpt.utils import chunked_cross_entropy, num_parameters
 
 # System settings
 model_name = "tiny-llama-1.1b"
-name = "packed-slimpajama-val-no-shuffle"
+name = "debug"
 out_dir = Path("out") / name
 use_wandb = True
 
 # Hyperparameters
-devices = 4
+devices = 4  # TODO: set this to 8
 
-global_batch_size = 16
+global_batch_size = 32  # TODO: should be 512
 learning_rate = 4e-4
-micro_batch_size = 1
+micro_batch_size = 1  # TODO: should be 8
 max_step = 715256 * 2
 warmup_steps = 2000
 log_step_interval = 2
 eval_iters = 100
-save_step_interval = 10000
+save_step_interval = 100
 eval_step_interval = 100
 
 weight_decay = 1e-1
@@ -69,7 +69,7 @@ hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str))
 
 def setup(resume: Union[bool, Path] = False):
     if use_wandb:
-        logger = WandbLogger(project="tinyllama", name="packed-slimpajama-val-no-shuffle", resume=(resume is not False))
+        logger = WandbLogger(project="tinyllama", name="debug-openwebtext", resume=(resume is not False))
     else:
         logger = CSVLogger(root_dir="logs", name="tinyllama")
 
@@ -100,8 +100,13 @@ def main(fabric, resume):
 
     config = Config.from_name(model_name)
 
-    train_dataloader, val_dataloader = create_dataloaders(fabric=fabric, batch_size=micro_batch_size, block_size=config.block_size)
-    train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
+    train_dataloader, val_dataloader = create_dataloaders(
+        fabric, batch_size=micro_batch_size, block_size=config.block_size
+    )
+    if val_dataloader is None:
+        train_dataloader = fabric.setup_dataloaders(train_dataloader)
+    else:
+        train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
     fabric.seed_everything(3407)  # same seed for every process to init model (FSDP)
 
@@ -112,11 +117,11 @@ def main(fabric, resume):
         model.apply(partial(init_weights, n_layer=config.n_layer))
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
-    fabric.print(f"Total parameters: {num_parameters(model):,}")
+    fabric.print(f"Total parameters {num_parameters(model):,}")
 
-    model = torch.compile(model)
+    # model = torch.compile(model)
     model = fabric.setup(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2))
     optimizer = fabric.setup_optimizers(optimizer)
 
     state = {"model": model, "optimizer": optimizer, "hparams": hparams, "iter_num": 0, "step_count": 0}
@@ -138,8 +143,10 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     model = state["model"]
     optimizer = state["optimizer"]
 
-    validate(fabric, model, val_dataloader, max_iters=2)  # sanity check
-    throughput = ThroughputMonitor(fabric, window_size=5)
+    if val_dataloader is not None:
+        validate(fabric, model, val_dataloader)  # sanity check
+    available_flops = get_available_flops(fabric.device, dtype=torch.bfloat16)
+    throughput = Throughput(available_flops=available_flops, world_size=fabric.world_size, window_size=5)
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
@@ -150,13 +157,13 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
 
+    total_lengths = 0
     total_t0 = time.perf_counter()
     initial_iter = state["iter_num"]
     curr_iter = 0
 
     for train_data in train_dataloader:
-        # resume data loader state by fast-forwarding through all seen batches
-        # drop this once streaming dataset supports proper resuming
+        # resume loader state. This is not elegant but it works. Should rewrite it in the future.
         if resume:
             if curr_iter < initial_iter:
                 curr_iter += 1
@@ -165,11 +172,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 resume = False
                 curr_iter = -1
                 fabric.barrier()
-                fabric.print(
-                    f"Resuming data loader finished."
-                    f"Took {time.perf_counter() - total_t0:.1f} seconds to reach iteration {initial_iter}."
-                )
-    
+                fabric.print("resume finished, taken {} seconds".format(time.perf_counter() - total_t0))
         if state["iter_num"] >= max_iters:
             break
 
@@ -178,13 +181,19 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        state["iter_num"] += 1
         iter_t0 = time.perf_counter()
 
-        input_ids = train_data[:, 0:model.config.block_size].contiguous().long()
-        targets = train_data[:, 1:(model.config.block_size + 1)].contiguous().long()
+        # input_ids = train_data[:, 0:model.config.block_size].contiguous().long()
+        # targets = train_data[:, 1:(model.config.block_size + 1)].contiguous().long()
+        input_ids, targets = train_data
 
-        is_accumulating = state["iter_num"] % gradient_accumulation_steps != 0
+        # for i in range(fabric.world_size):
+        #     if i == fabric.global_rank:
+        #         print("input", fabric.global_rank, input_ids[0][0:10].tolist())
+        #         print("target", fabric.global_rank, targets[0][0:10].tolist())
+        #     fabric.barrier()
+
+        is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
             loss = chunked_cross_entropy(logits, targets, chunk_size=0)
@@ -195,9 +204,11 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
+
+        state["iter_num"] += 1
         
         if state["iter_num"] % log_iter_interval == 0:
-            loss = loss.item()  # expensive device-to-host synchronization
+            loss = loss.item()
             t1 = time.perf_counter()
             throughput.update(
                 time=(t1 - total_t0), 
@@ -212,8 +223,6 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 "step": state['step_count'],
                 "iter_time": (t1 - iter_t0),
                 "remaining_time": (t1 - total_t0) / (state['iter_num'] - initial_iter) * (max_iters - state['iter_num']),
-                "tokens": state["iter_num"] * micro_batch_size * model.config.block_size,
-                "total_tokens": state["iter_num"] * micro_batch_size * model.config.block_size * fabric.world_size,
             }
 
             fabric.print(
@@ -224,20 +233,20 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
 
             throughput_metrics = throughput.compute()
             metrics.update(throughput_metrics)
-            fabric.log_dict(metrics, step=state["iter_num"])
+            fabric.log_dict(metrics, step=state["step_count"])
 
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval_step_interval == 0:
             t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_dataloader, max_iters=eval_iters)
-            val_loss = val_loss.item()
+            val_loss = validate(fabric, model, val_dataloader)
             td = time.perf_counter() - t0
 
             fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
             metrics = {
                 "val_loss": val_loss,
+                "total_tokens": model.config.block_size * state["iter_num"] * micro_batch_size * fabric.world_size,
                 "val_ppl": math.exp(val_loss),
             }
-            fabric.log_dict(metrics, step=state["iter_num"])
+            fabric.log_dict(metrics, step=state["step_count"])
             fabric.barrier()
 
         if not is_accumulating and state["step_count"] % save_step_interval == 0:
@@ -247,144 +256,63 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
 
 
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int) -> torch.Tensor:
+def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader) -> float:
     fabric.print("Validating ...")
     model.eval()
 
-    losses = torch.zeros(max_iters, device=fabric.device)
+    losses = torch.zeros(eval_iters, device=fabric.device)
     for k, val_data in enumerate(val_dataloader):
-        if k >= max_iters:
+        if k >= eval_iters:
             break
-        input_ids = val_data[:, 0:model.config.block_size].contiguous().long()
-        targets = val_data[:, 1:(model.config.block_size + 1)].contiguous().long()
+        # input_ids = val_data[:, 0:model.config.block_size].contiguous().long()
+        # targets = val_data[:, 1:(model.config.block_size + 1)].contiguous().long()
+        input_ids, targets = val_data
         logits = model(input_ids)
         loss = chunked_cross_entropy(logits, targets, chunk_size=0)
         losses[k] = loss
 
     model.train()
-    return losses.mean()
+    return losses.mean().item()
 
 
-def create_dataloader(
-    batch_size: int, block_size: int, data_dir: Path, fabric, shuffle: bool = True, seed: int = 12345, split="train"
-) -> DataLoader:
-    from lit_gpt.packed_dataset import CombinedDataset, PackedDataset
-
-    train_data_config = [
-        ("train_slim", 0.693584),
-        ("train_star", 0.306416),
-    ]
-
-    val_data_config = [
-        ("val", 1.0),
-    ]
-
-    datasets = []
-    data_config = train_data_config if split == "train" else val_data_config
-    for prefix, _ in data_config:
-        filenames = sorted(glob.glob(str(data_dir / f"{prefix}*")))
-        random.seed(seed)
-        random.shuffle(filenames)
-
-        dataset = PackedDataset(
-            filenames,
-            # n_chunks control the buffer size. 
-            # Note that the buffer size also impacts the random shuffle
-            # (PackedDataset is an IterableDataset. So the shuffle is done by prefetch a buffer and shuffle the buffer)
-            n_chunks=8,
-            block_size=block_size,
-            shuffle=shuffle,
-            seed=seed+fabric.global_rank,
-            num_processes=fabric.world_size,
-            process_rank=fabric.global_rank,
-        )
-        datasets.append(dataset)
-
-    if not datasets:
-        raise RuntimeError(
-            f"No data found at {data_dir}. Make sure you ran prepare_redpajama.py to create the dataset."
-        )
-
-    weights = [weight for _, weight in data_config]
-    sum_weights = sum(weights)
-    weights = [el / sum_weights for el in weights]
-
-    combined_dataset = CombinedDataset(datasets=datasets, seed=seed, weights=weights)
-
-    return DataLoader(combined_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
-
-
-def create_dataloaders(
-    batch_size: int,
-    block_size: int,
-    fabric,
-    train_data_dir: Path = Path("data/packed/slimpajama/val-full"),
-    val_data_dir = Path("data/packed/slimpajama/val-full"),
-    seed: int = 12345,
-) -> Tuple[DataLoader, DataLoader]:
+def create_dataloaders(fabric: L.Fabric, batch_size: int, block_size: int) -> Tuple[DataLoader, DataLoader]:
     # Increase by one because we need the next word as well
     effective_block_size = block_size + 1
-    train_dataloader = create_dataloader(
-        batch_size=batch_size,
-        block_size=effective_block_size,
-        fabric=fabric,
-        data_dir=train_data_dir,
+
+    train_dataset, val_dataset = load_datasets(Path("data2/openwebtext/"), block_size)
+    return DataLoader(train_dataset, batch_size=batch_size, pin_memory=True, num_workers=8), DataLoader(val_dataset, batch_size=batch_size, pin_memory=True, num_workers=8)
+
+    train_datasets = [
+        StreamingDataset(
+            input_dir="data/slimpajama/train",
+            item_loader=TokensLoader(block_size=effective_block_size), 
+            shuffle=True,
+            drop_last=True,
+        ),
+        StreamingDataset(
+            input_dir="data/starcoder",
+            item_loader=TokensLoader(block_size=effective_block_size), 
+            shuffle=True,
+            drop_last=True,
+        ),
+    ]
+
+    # Mix SlimPajama data and Starcoder data with these proportions:
+    weights = (0.693584, 0.306416)
+    weights = [w / sum(weights) for w in weights]
+
+    combined_dataset = CombinedDataset(datasets=train_datasets, seed=42, weights=weights)
+    train_dataloader = DataLoader(combined_dataset, batch_size=batch_size, pin_memory=True, num_workers=8)
+
+    val_dataset = StreamingDataset(
+        input_dir="data/slimpajama/val",
+        item_loader=TokensLoader(block_size=effective_block_size), 
         shuffle=False,
-        seed=seed,
-        split="validation"
+        # Consider setting to False, but we would lose some samples due to truncation when world size > 1
+        drop_last=True,
     )
-    val_dataloader = (
-        create_dataloader(
-            batch_size=batch_size,
-            block_size=effective_block_size,
-            fabric=fabric,
-            data_dir=val_data_dir,
-            shuffle=False,
-            seed=seed,
-            split="validation"
-        )
-        if val_data_dir
-        else None
-    )
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, pin_memory=True, num_workers=8)
     return train_dataloader, val_dataloader
-
-
-# def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, DataLoader]:
-#     from lightning.data import StreamingDataset
-#     from lightning.data.streaming.item_loader import TokensLoader
-
-#     # Increase by one because we need the next word as well
-#     effective_block_size = block_size + 1
-
-#     train_datasets = [
-#         StreamingDataset(
-#             input_dir="data/slimpajama/train",
-#             item_loader=TokensLoader(block_size=effective_block_size), 
-#             shuffle=True,
-#             drop_last=True,
-#         ),
-#         StreamingDataset(
-#             input_dir="data/starcoder",
-#             item_loader=TokensLoader(block_size=effective_block_size), 
-#             shuffle=True,
-#             drop_last=True,
-#         ),
-#     ]
-
-#     # Mix SlimPajama data and Starcoder data with these proportions:
-#     weights = (0.693584, 0.306416)
-#     combined_dataset = CombinedDataset(datasets=train_datasets, seed=42, weights=weights)
-#     train_dataloader = DataLoader(combined_dataset, batch_size=batch_size, pin_memory=True, num_workers=8)
-
-#     val_dataset = StreamingDataset(
-#         input_dir="data/slimpajama/val",
-#         item_loader=TokensLoader(block_size=effective_block_size), 
-#         shuffle=True,
-#         # Consider setting to False, but we would lose some samples due to truncation when world size > 1
-#         drop_last=True,
-#     )
-#     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, pin_memory=True, num_workers=8)
-#     return train_dataloader, val_dataloader
 
 
 # learning rate decay scheduler (cosine with warmup)
@@ -405,9 +333,9 @@ def get_lr(it):
 def init_weights(module: nn.Module, n_layer: int):
     # Follows GPT-NeoX: https://arxiv.org/abs/2204.06745
     if isinstance(module, nn.Embedding):
-        nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / module.weight.shape[1]))
+        nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / module.weight.size(1)))
     elif isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / module.weight.shape[1]))
+        nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / module.weight.size(1)))
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     for name, param in module.named_parameters():
@@ -415,13 +343,34 @@ def init_weights(module: nn.Module, n_layer: int):
             nn.init.normal_(param, mean=0.0, std=(1 / math.sqrt(param.shape[-1]) / n_layer))
 
 
+from torch.utils.data import IterableDataset
+import numpy as np
+
+
+def load_datasets(data_dir: Path, max_seq_length: int) -> Tuple["Dataset", "Dataset"]:
+    train_data = Dataset(data_dir / "train.bin", max_seq_length)
+    val_data = Dataset(data_dir / "val.bin", max_seq_length)
+    return train_data, val_data
+
+
+class Dataset(IterableDataset):
+    def __init__(self, data_file: Path, max_seq_length: int):
+        super().__init__()
+        self.data_file = data_file
+        self.max_seq_length = max_seq_length
+
+    def __iter__(self):
+        data = np.memmap(self.data_file, dtype=np.uint16, mode="r")
+        while True:
+            i = torch.randint(len(data) - self.max_seq_length, (1,)).item()
+            x = torch.from_numpy((data[i : i + self.max_seq_length]).astype(np.int64))
+            y = torch.from_numpy((data[i + 1 : i + 1 + self.max_seq_length]).astype(np.int64))
+            yield x, y
+
+
 if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
 
     from jsonargparse import CLI
-    from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_2_2
-
-    if not _TORCH_GREATER_EQUAL_2_2:
-        raise ImportError("The tinyllama.py training script requires PyTorch 2.2 (nightly) or higher to run.")
 
     CLI(setup)
