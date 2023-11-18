@@ -1,19 +1,25 @@
+import copy
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import lightning as L
+import lm_eval.api.instance
+import lm_eval.api.model
+import lm_eval.evaluator
+import lm_eval.tasks
+import lm_eval.utils
 import torch
 from lightning.fabric.plugins import BitsandbytesPrecision
-from lm_eval import base, evaluator, tasks
-from lm_eval.base import BaseLM
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from generate.base import generate
+
 from lit_gpt import GPT, Config, Tokenizer
 from lit_gpt.utils import (
     check_valid_checkpoint_dir,
@@ -23,148 +29,135 @@ from lit_gpt.utils import (
 )
 
 
-class EvalHarnessBase(BaseLM):
-    # Credits:
-    # https://github.com/EleutherAI/gpt-neox/blob/main/eval_tasks/eval_adapter.py
-    def __init__(self, fabric: L.Fabric, model: GPT, tokenizer: Tokenizer, batch_size: int, temperature: float):
+class EvalHarnessLM(lm_eval.api.model.LM):
+    """https://github.com/EleutherAI/lm-evaluation-harness/blob/big-refactor/docs/model_guide.md"""
+
+    def __init__(self, fabric: L.Fabric, model: GPT, tokenizer: Tokenizer, batch_size: int) -> int:
         super().__init__()
         self.fabric = fabric
         self.model = model
         self.tokenizer = tokenizer
-        self.batch_size_per_gpu = batch_size
-        self.temperature = temperature
+        self.batch_size = batch_size
+
+    def loglikelihood(self, requests: List[lm_eval.api.instance.Instance]) -> List[Tuple[float, bool]]:
+        raise NotImplementedError
+
+    def loglikelihood_rolling(self, requests: List[lm_eval.api.instance.Instance]) -> List[Tuple[float, bool]]:
+        raise NotImplementedError
+
+    def generate_until(self, requests: List[lm_eval.api.instance.Instance]) -> List[str]:
+        """https://github.com/EleutherAI/lm-evaluation-harness/blob/afda6551e9e8d8021c1fdd35d2aad0fbe63f3919/lm_eval/models/huggingface.py#L823"""
+        res = defaultdict(list)
+        re_ords = {}
+
+        def _collate(x):
+            # the negative sign on len(toks) sorts descending - this has a few advantages:
+            # - time estimates will always be over not underestimates, which is more useful for planning
+            # - to know the size of a batch when going through the list, you know the first one is always the batch
+            #   padded context length. this is useful to simplify the batching logic and more importantly to make
+            #   automatic adaptive batches much much easier to implement
+            # - any OOMs will happen right away rather than near the end
+            toks = self.tok_encode(x[0])
+            return -len(toks), x[0]
+
+        # we group requests by their generation_kwargs,
+        # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
+        # in the same batch.
+        grouper = lm_eval.utils.Grouper(requests, lambda x: str(x.args[1]))
+        for key, reqs in grouper.get_grouped().items():
+            # within each set of reqs for given kwargs, we reorder by token length, descending.
+            re_ords[key] = lm_eval.utils.Reorderer([req.args for req in reqs], _collate)
+
+        # for each different set of kwargs, we execute all requests, by batch.
+        for key, re_ord in re_ords.items():
+            chunks = lm_eval.utils.chunks(
+                re_ord.get_reordered(),
+                n=self.batch_size
+            )
+            for chunk in chunks:
+                contexts, all_gen_kwargs = zip(*chunk)
+                # we assume all gen kwargs in the batch are the same
+                # this is safe to assume because the `grouper` object ensures it.
+                gen_kwargs = all_gen_kwargs[0]
+                # unpack our keyword arguments.
+                until: Optional[List[str]] = None
+                if isinstance(gen_kwargs, dict):
+                    kwargs = copy.deepcopy(gen_kwargs)  # edge case for repeats > 1
+                    if "until" in kwargs.keys():
+                        until = kwargs.pop("until")
+                        if isinstance(until, str):
+                            until = [until]
+                        elif not isinstance(until, list):
+                            raise ValueError(
+                                f"Expected `kwargs['until']` to be of type Union[str,list] but got {until}"
+                            )
+                else:
+                    raise ValueError(
+                        f"Expected `kwargs` to be of type `dict` but got {gen_kwargs}"
+                    )
+                if not until:
+                    eos_id = self.tokenizer.eos_id
+                else:
+                    eos_id = self.tokenizer.encode(until[0])
+                if "max_gen_toks" in kwargs.keys():
+                    max_gen_toks = kwargs.pop("max_gen_toks")
+                else:
+                    max_gen_toks = self.model.config.block_size
+
+                context_enc = torch.tensor(self.tok_encode(contexts[0]), device=self.fabric.device)
+
+                if "max_returned_tokens" not in kwargs:
+                    kwargs["max_returned_tokens"] = min(context_enc.shape[0] + max_gen_toks, self.model.config.block_size)
+
+                # set the max length in tokens of inputs ("context_enc")
+                with self.fabric.init_tensor():
+                    self.model.max_seq_length = kwargs["max_returned_tokens"]
+                    self.model.set_kv_cache(batch_size=self.batch_size)
+
+                # unused
+                kwargs.pop("do_sample", None)
+
+                # perform batched generation
+                cont = generate(self.model, context_enc, eos_id=eos_id.to(context_enc.device), **kwargs)
+
+                s = self.tok_decode(cont)
+
+                # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
+                for term in until:
+                    if len(term) > 0:
+                        # ignore '' separator,
+                        # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
+                        s = s.split(term)[0]
+
+                res[key].append(s)
+
+                self.cache_hook.add_partial(
+                    "generate_until", (contexts[0], gen_kwargs), s
+                )
+            # reorder this group of results back to original unsorted form
+            res[key] = re_ord.get_original(res[key])
+
+        return grouper.get_original(res)
+
+    def tok_encode(self, string: str) -> List[int]:
+        return self.tokenizer.encode(string, bos=False, eos=False).tolist()
+
+    def tok_decode(self, tokens: Union[torch.Tensor, List[int]]) -> str:
+        return self.tokenizer.decode(tokens)
 
     @classmethod
     def create_from_arg_string(cls, arg_string, additional_config=None):
-        kwargs = {el.split("=")[0]: el.split("=")[1] for el in arg_string.split(",")}
-        return cls(**kwargs, **additional_config)
-
-    @property
-    def eot_token_id(self):
-        # we use EOT because end of *text* is more accurate for what we're doing than end of *sentence*
-        return self.tokenizer.eos_id
-
-    @property
-    def max_length(self):
-        return self.model.max_seq_length
-
-    @property
-    def vocab_size(self):
-        return self.tokenizer.vocab_size
-
-    @property
-    def max_gen_toks(self):
-        return 256
-
-    @property
-    def batch_size(self):
-        return self.batch_size_per_gpu * self.fabric.world_size
-
-    @property
-    def device(self):
-        return self.fabric.device
-
-    def tok_encode(self, string: str):
-        return self.tokenizer.encode(string, bos=False, eos=False).tolist()
-
-    def tok_decode(self, tokens):
-        t = torch.tensor(tokens)
-        return self.tokenizer.decode(t)
-
-    @torch.inference_mode()
-    def _model_call(self, inps):
-        """
-        inps: a torch tensor of shape [batch, sequence]
-        the size of sequence may vary from call to call
-        returns: a torch tensor of shape [batch, sequence, vocab] with the
-        logits returned from the model
-        """
-        return self.model(inps)
-
-    def _model_generate(self, context, max_length, eos_token_id):
-        assert context.shape[0] == 1
-        out = generate(
-            self.model, context[0], max_length, temperature=self.temperature, top_k=None, eos_id=eos_token_id
-        )
-
-        return self.tokenizer.decode(out)
-
-    @torch.inference_mode()
-    def run_eval(
-        self,
-        eval_tasks=None,
-        num_fewshot=0,
-        bootstrap_iters=2,
-        description_dict=None,
-        use_cache=True,
-        name="lit-gpt",
-        limit=None,
-    ):
-        if eval_tasks is None:
-            eval_tasks = ["arc_challenge", "piqa", "hellaswag", "hendrycksTest-*"]
-
-        # Returns a list containing all values of the task registry that
-        # match at least one of the patterns
-        import fnmatch
-
-        def pattern_match(patterns, source_list):
-            task_names = set()
-            for pattern in patterns:
-                for matching in fnmatch.filter(source_list, pattern):
-                    task_names.add(matching)
-            return list(task_names)
-
-        eval_tasks = pattern_match(eval_tasks, tasks.ALL_TASKS)
-        print(f"Found tasks: {eval_tasks}")
-
-        # **HACK INCOMING**:
-        # first get task dict on local main rank
-        # the tasks are downloaded *as they are initialized*, and the downloads don't like multithreading.
-        # so we download them once on the local main rank, wait, and then initialize them on all other ranks, which *should* load from the cache.
-        if self.fabric.local_rank == 0:
-            tasks.get_task_dict(eval_tasks)
-        # torch barrier
-        self.fabric.barrier()
-        tasks.get_task_dict(eval_tasks)
-
-        lm = self
-        if use_cache:
-            lm = base.CachingLM(lm, "lm_cache/" + name + ".db")
-
-        results = evaluator.evaluate(
-            lm=lm,
-            task_dict=tasks.get_task_dict(eval_tasks),
-            description_dict=description_dict,
-            num_fewshot=num_fewshot,
-            limit=limit,
-            bootstrap_iters=bootstrap_iters,
-        )
-
-        results["config"] = {
-            "model": self.model.config.name,
-            "num_fewshot": num_fewshot,
-            "batch_size": self.batch_size,
-            "device": str(self.device),
-            "no_cache": not use_cache,
-            "limit": limit,
-            "bootstrap_iters": bootstrap_iters,
-            "description_dict": description_dict,
-        }
-
-        return results
+        raise NotImplementedError
 
 
 @torch.inference_mode()
 def run_eval_harness(
     checkpoint_dir: Path,
     precision: Optional[str] = None,
-    batch_size=1,
-    temperature=1.0,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
-    eval_tasks: Optional[List[str]] = None,
-    num_fewshot=0,
-    bootstrap_iters=2,
+    eval_tasks: List[str] = ["arc_challenge", "piqa", "hellaswag", "hendrycksTest-*"],
     save_filepath: Optional[Path] = None,
+    **kwargs: Any,
 ):
     if precision is None:
         precision = get_default_supported_precision(training=False)
@@ -179,7 +172,6 @@ def run_eval_harness(
 
     fabric = L.Fabric(devices=1, precision=precision, plugins=plugins)
 
-    checkpoint_dir = Path(checkpoint_dir)
     check_valid_checkpoint_dir(checkpoint_dir)
     tokenizer = Tokenizer(checkpoint_dir)
 
@@ -196,17 +188,14 @@ def run_eval_harness(
     print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)
     with fabric.init_module(empty_init=True), gptq_quantization(quantize == "gptq.int4"):
         model = GPT(config)
-
     model.eval()
     model = fabric.setup_module(model)
-
     load_checkpoint(fabric, model, checkpoint_path)
 
-    eval_harness = EvalHarnessBase(fabric, model, tokenizer, batch_size, temperature)
-
-    results = eval_harness.run_eval(
-        eval_tasks=eval_tasks, num_fewshot=num_fewshot, bootstrap_iters=bootstrap_iters, use_cache=False
-    )
+    # https://github.com/EleutherAI/lm-evaluation-harness/blob/big-refactor/docs/interface.md
+    lm_obj = EvalHarnessLM(fabric, model, tokenizer, 1)
+    lm_eval.tasks.initialize_tasks()
+    results = lm_eval.evaluator.simple_evaluate(model=lm_obj, tasks=list(eval_tasks), **kwargs)
     if save_filepath is None:
         print(results)
     else:
