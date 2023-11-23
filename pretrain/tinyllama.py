@@ -33,11 +33,11 @@ out_dir = Path("out") / name
 use_wandb = False
 
 # Hyperparameters
-devices = 8
+devices = 1
 
 global_batch_size = 512
 learning_rate = 4e-4
-micro_batch_size = 4  # CHANGE: 4 on A100, 8 on H100
+micro_batch_size = 4  # CHANGE: 4 on A100, 8 on H100 (or whatever is max)
 max_tokens = int(3e12)  # 3 trillion
 warmup_steps = 2000
 log_step_interval = 1
