@@ -24,7 +24,7 @@ sys.path.append(str(wd))
 
 from lit_gpt.model import GPT, Block, Config, LLaMAMLP, CausalSelfAttention
 from lit_gpt.packed_dataset import CombinedDataset
-from lit_gpt.utils import chunked_cross_entropy, num_parameters
+from lit_gpt.utils import chunked_cross_entropy, num_parameters, warm_up
 
 # System settings
 model_name = "tiny-llama-1.1b"
@@ -148,6 +148,9 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
         measured_flops = measure_flops(meta_model, model_fwd, model_loss)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
+
+    # warm up the compiled model
+    warm_up(model, batch_size=micro_batch_size)
 
     max_tokens_per_device = max_tokens // fabric.world_size
     tokens_per_iter = micro_batch_size * model.config.block_size

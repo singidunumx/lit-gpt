@@ -349,3 +349,11 @@ def estimate_flops(model: "GPT", training: bool) -> int:
     # forward + backward
     frozen_ops_per_step = 2 if training else 1
     return ops_per_step * trainable_flops + frozen_ops_per_step * frozen_flops
+
+
+def warm_up(model: "GPT", iters: int = 2, batch_size: int = 1) -> None:
+    """Use this to warm up a compiled model before you start measuring runtime performance."""
+    device = next(model.parameters()).device
+    x = torch.randint(0, model.config.vocab_size, size=(batch_size, model.config.block_size), device=device)
+    for _ in range(iters):
+        model(x).sum().backward()
