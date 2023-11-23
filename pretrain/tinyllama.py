@@ -28,7 +28,7 @@ from lit_gpt.utils import chunked_cross_entropy, num_parameters
 
 # System settings
 model_name = "tiny-llama-1.1b"
-name = "lit-tiny-llama-1.1b"
+name = "benchmarks-a100"  # CHANGE
 out_dir = Path("out") / name
 use_wandb = False
 
@@ -37,7 +37,7 @@ devices = 8
 
 global_batch_size = 512
 learning_rate = 4e-4
-micro_batch_size = 8
+micro_batch_size = 4  # CHANGE: 4 on A100, 8 on H100
 max_tokens = int(3e12)  # 3 trillion
 warmup_steps = 2000
 log_step_interval = 1
@@ -80,6 +80,7 @@ def setup(resume: Union[bool, Path] = False):
     else:
         strategy = "auto"
 
+    # CHANGE: bf16-true, bf16-mixed
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[logger])
     fabric.launch()
 
@@ -136,7 +137,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     model = state["model"]
     optimizer = state["optimizer"]
 
-    validate(fabric, model, val_dataloader, max_iters=2)  # sanity check
+    validate(fabric, model, val_dataloader, max_iters=0)  # sanity check
     throughput = ThroughputMonitor(fabric, window_size=5)
 
     with torch.device("meta"):
@@ -266,9 +267,22 @@ def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max
     return losses.mean()
 
 
+class FakeDataset(torch.utils.data.Dataset):
+    def __len__(self):
+        return 1000000000
+    def __getitem__(self, idx):
+        return torch.randint(0, 32000, size=(2049,))
+
+
 def create_dataloaders(batch_size: int, block_size: int) -> Tuple[DataLoader, DataLoader]:
     from lightning.data import StreamingDataset
     from lightning.data.streaming.item_loader import TokensLoader
+
+    if True:
+        return (
+            DataLoader(FakeDataset(), batch_size=batch_size, pin_memory=True, num_workers=8),
+            DataLoader(FakeDataset(), batch_size=batch_size, pin_memory=True, num_workers=8),
+        )
 
     # Increase by one because we need the next word as well
     effective_block_size = block_size + 1
