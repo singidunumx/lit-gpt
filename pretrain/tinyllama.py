@@ -66,7 +66,7 @@ def setup(resume: Union[bool, Path] = False):
     if use_wandb:
         logger = WandbLogger(project="tinyllama", name=name, resume=(resume is not False))
     else:
-        logger = CSVLogger(root_dir="logs", name=name, flush_logs_every_n_steps=5)
+        logger = CSVLogger(root_dir="logs", name=name, flush_logs_every_n_steps=1)
 
     if devices > 1:
         strategy = FSDPStrategy(
