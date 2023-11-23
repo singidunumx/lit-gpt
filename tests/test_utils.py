@@ -3,6 +3,7 @@ from contextlib import redirect_stderr
 from io import StringIO
 
 import pytest
+from unittest.mock import Mock
 import torch
 import torch.nn.functional as F
 from conftest import RunIf
@@ -165,3 +166,16 @@ def test_num_parameters_bitsandbytes(mode):
     with fabric.init_module(empty_init=True):
         model = GPT.from_name("pythia-70m")
     assert num_parameters(model) == 70426624
+
+
+@pytest.mark.parametrize("iters", [1, 2, 3])
+def test_warm_up(iters):
+    from lit_gpt import GPT, Config
+    from lit_gpt.utils import warm_up
+
+    config = Config.from_name("pythia-70m")
+    model = GPT(config)
+    model.forward = Mock()
+    warm_up(model, iters=iters)
+    model.forward.call_count == iters
+    model.forward().sum().backward.call_count == iters
