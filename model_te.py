@@ -59,7 +59,7 @@ class GPT(BaseModel):
 
         x = self.wte(idx)
         for block in self.transformer.h:
-            x = block(x, cos, sin, input_pos)
+            x = block(x, cos, sin)
         return self.ln_f_lm_head(x)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
