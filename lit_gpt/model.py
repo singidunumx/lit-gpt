@@ -289,6 +289,29 @@ class LLaMAMLP(nn.Module):
         return self.proj(x)
 
 
+class LLaMAMoE(nn.Module):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.experts = nn.ModuleList([LLaMAMLP(config) for i in range(num_experts)])
+        self.gate = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+    def forward(self, x):
+        orig_shape = x.shape
+        x = x.view(-1, x.shape[-1])
+
+        scores = self.gate(x).softmax(dim=-1)
+        expert_weights, expert_indices = torch.topk(scores, self.num_experts_per_tok, dim=-1)
+        flat_expert_indices = expert_indices.view(-1)
+
+        x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
+        y = torch.empty_like(x)
+        for i, expert in enumerate(self.experts):
+            y[flat_expert_indices == i] = expert(x[flat_expert_indices == i])        
+        y = (y.view(*expert_weights.shape, -1) * expert_weights.unsqueeze(-1)).sum(dim=1)
+        return y.view(*orig_shape)
+
+
 def build_rope_cache(
     seq_len: int, n_elem: int, device: Optional[torch.device] = None, base: int = 10000, condense_ratio: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:

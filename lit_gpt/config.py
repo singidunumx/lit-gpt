@@ -55,6 +55,8 @@ class Config:
     intermediate_size: Optional[int] = None
     rope_condense_ratio: int = 1
     rope_base: int = 10000
+    num_experts_per_tok: Optional[int] = None
+    num_experts: Optional[int] = None
 
     def __post_init__(self):
         if not self.name:
@@ -1171,7 +1173,7 @@ for c in mistral:
 mixtral = [
     # https://huggingface.co/mistralai/Mistral-7B-v0.1/blob/main/config.json
     dict(
-        name="mixtral-8-7B",
+        name="mixtral-8x7b-32kseqlen",
         padded_vocab_size=32000,
         block_size=4096,  # should be 32768 but sliding window attention is not implemented
         n_layer=32,
