@@ -1168,6 +1168,28 @@ for c in mistral:
         copy["hf_config"]["name"] = c["hf_config"]["name"].format(kind)
         configs.append(copy)
 
+mixtral = [
+    # https://huggingface.co/mistralai/Mistral-7B-v0.1/blob/main/config.json
+    dict(
+        name="mixtral-8-7B",
+        padded_vocab_size=32000,
+        block_size=4096,  # should be 32768 but sliding window attention is not implemented
+        n_layer=32,
+        n_query_groups=8,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        _norm_class="RMSNorm",
+        norm_eps=1e-05,
+        _mlp_class="LLaMAMLP",
+        intermediate_size=14336,
+        rope_base=1e6,
+        num_experts_per_tok=2,
+        num_experts=8
+    )
+]
+configs.extend(mixtral)
+
 
 ############
 # TinyLlama
