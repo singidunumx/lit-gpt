@@ -36,7 +36,7 @@ devices = 1
 
 # Hyperparameters
 learning_rate = 3e-4
-batch_size = 128
+batch_size = 16
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
@@ -104,8 +104,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
     if fabric.global_rank == 0:
         os.makedirs(out_dir, exist_ok=True)
 
-    train_data = torch.load(data_dir / "train.pt")
-    val_data = torch.load(data_dir / "test.pt")
+    train_f = open(data_dir / "train.pt", "rb")
+    train_data = torch.load(train_f)
+    test_f = open(data_dir / "test.pt", "rb")
+    val_data = torch.load(test_f)
 
     if not any((lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head)):
         fabric.print("Warning: all LoRA layers are disabled!")
@@ -177,7 +179,7 @@ def train(
     )
 
     validate(fabric, model, val_data, tokenizer, max_iters=2)  # sanity check
-
+    
     throughput = ThroughputMonitor(fabric, window_size=50)
     step_count = 0
     total_lengths = 0
@@ -195,11 +197,12 @@ def train(
         input_ids, targets = get_batch(fabric, train_data, longest_seq_ix if iter_num == 1 else None)
 
         is_accumulating = iter_num % gradient_accumulation_iters != 0
+        torch.cuda.empty_cache()
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids, lm_head_chunk_size=128)
             # shift the targets such that output n predicts token n+1
             logits[-1] = logits[-1][..., :-1, :]
-            loss = chunked_cross_entropy(logits, targets[..., 1:])
+            loss = chunked_cross_entropy(logits, targets[..., 1:], chunk_size=10)
             fabric.backward(loss / gradient_accumulation_iters)
 
         if not is_accumulating:
