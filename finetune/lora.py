@@ -31,13 +31,14 @@ eval_interval = 100
 save_interval = 100
 eval_iters = 100
 eval_max_new_tokens = 100
-log_interval = 1
+log_interval = 10
 devices = 1
 
 # Hyperparameters
 learning_rate = 3e-4
-batch_size = 16
-micro_batch_size = 4
+learning_rate_sgd = 0.01
+batch_size = 128
+micro_batch_size = 1
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 max_seq_length = None  # assign value to truncate
@@ -47,11 +48,11 @@ lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
 lora_query = True
-lora_key = False
+lora_key = True
 lora_value = True
-lora_projection = False
-lora_mlp = False
-lora_head = False
+lora_projection = True
+lora_mlp = True
+lora_head = True
 warmup_steps = 100
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
@@ -63,8 +64,10 @@ def setup(
     out_dir: Path = Path("out/lora/alpaca"),
     precision: Optional[str] = None,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8-training"]] = None,
+    optimizer: Optional[Literal["SGD", "Adam"]] = None,
 ) -> None:
     precision = precision or get_default_supported_precision(training=True)
+    optimizer = optimizer
 
     plugins = None
     if quantize is not None and quantize.startswith("bnb."):
@@ -93,10 +96,10 @@ def setup(
     logger = CSVLogger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=logger, plugins=plugins)
     fabric.print(hparams)
-    fabric.launch(main, data_dir, checkpoint_dir, out_dir)
+    fabric.launch(main, data_dir, checkpoint_dir, out_dir, optimizer)
 
 
-def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) -> None:
+def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, optimizer: str) -> None:
     check_valid_checkpoint_dir(checkpoint_dir)
 
     fabric.seed_everything(1337)  # same seed for every process to init model (FSDP)
@@ -106,8 +109,15 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
 
     train_f = open(data_dir / "train.pt", "rb")
     train_data = torch.load(train_f)
+    global max_iters
+    print("max_iters=" + str(max_iters))
+    max_iters = len(train_data)
+    print("Reset max_iters=" + str(max_iters))
+    print("Train data size=" + str(len(train_data)))
     test_f = open(data_dir / "test.pt", "rb")
     val_data = torch.load(test_f)
+    print("Test data size=" + str(len(val_data)))
+    
 
     if not any((lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head)):
         fabric.print("Warning: all LoRA layers are disabled!")
@@ -123,6 +133,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
         to_mlp=lora_mlp,
         to_head=lora_head,
     )
+    max_iters
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
     with fabric.init_module(empty_init=(devices > 1)):
@@ -137,10 +148,20 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if isinstance(fabric.strategy.precision, BitsandbytesPrecision):
         import bitsandbytes as bnb
-
-        optimizer = bnb.optim.PagedAdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        if not optimizer or optimizer == "Adam" :
+            print("Using bitsandbytes PagedAdamW optimizer")
+            optimizer = bnb.optim.PagedAdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer == "SGD":
+            print("Using bitsandbytes SGD optimizer")
+            optimizer = bnb.optim.SGD(trainable_params, lr=learning_rate_sgd, weight_decay=weight_decay)
     else:
-        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        if not optimizer or optimizer == "Adam" :
+            print("Using Adam optimizer")
+            optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer == "SGD":
+            print("Using SGD optimizer")
+            optimizer = torch.optim.SGD(trainable_params, lr=learning_rate_sgd, weight_decay=weight_decay)
+    
     optimizer = fabric.setup_optimizers(optimizer)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iters // batch_size)
 
@@ -207,6 +228,7 @@ def train(
 
         if not is_accumulating:
             optimizer.step()
+            print("Zero grad call /n")
             optimizer.zero_grad()
             if step_count > warmup_steps:
                 scheduler.step()
@@ -223,6 +245,7 @@ def train(
             fabric.print(
                 f"iter {iter_num} step {step_count}: loss {loss_item:.4f}, iter time:"
                 f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
+                f" {(t1 - total_t0) * 1000:.2f}ms Total time"
             )
 
         if not is_accumulating and step_count % eval_interval == 0:
