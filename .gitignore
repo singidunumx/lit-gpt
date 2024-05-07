@@ -19,3 +19,6 @@ events.out.tfevents*
 
 tests/reference_models
 data-10k/alpaca/alpaca_data_cleaned_archive.json
+# test artifacts from tests/test_readme.py
+tests/custom_finetuning_dataset.json
+tests/custom_texts
